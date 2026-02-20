@@ -1388,6 +1388,8 @@ public class Utilities {
       return String.format("%s hours", d.toHours());
     } else if (d.toMinutes() > 2) {
       return String.format("%s mins", d.toMinutes());
+    } else if (d.toSeconds() > 2) {
+      return String.format("%s secs", d.toSeconds());
     } else {
       return String.format("%s ms", d.toMillis());
     }
