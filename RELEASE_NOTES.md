@@ -1,10 +1,10 @@
 ## Validator Changes
 
-Note: this version is synchronised with a major update to tx.fhir.org. 
-Implementers SHOULD upgrade to this version immediately - this is the 
+Note: this version is synchronised with a major update to tx.fhir.org.
+Implementers SHOULD upgrade to this version immediately - this is the
 oldest validator version *supported* for use with the new server. On
 the other hand, there's no change to the terminology server API - older
-version of the validator SHOULD continue to work. But how some cases 
+version of the validator SHOULD continue to work. But how some cases
 are handled - particularly around supplements - has changed.
 
 * Update internal terminology server for new server on tx.fhir.org
