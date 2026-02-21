@@ -161,7 +161,7 @@ public class CanonicalResourceManager<T extends CanonicalResource> {
     @Setter
     @Getter
     int loadingOrder = 0;
-    private T1 resource;
+    private volatile T1 resource;
     private CanonicalResourceProxy proxy;
     @Getter
     private PackageInformation packageInfo;
@@ -185,6 +185,8 @@ public class CanonicalResourceManager<T extends CanonicalResource> {
     }
     
     public T1 getResource() {
+      T1 r = resource;
+      if (r != null) return r;
       synchronized (this) {
         if (resource == null) {
           T1 res = (T1) proxy.getResource();

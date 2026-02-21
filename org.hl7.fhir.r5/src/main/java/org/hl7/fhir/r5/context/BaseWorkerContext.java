@@ -48,6 +48,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.atomic.AtomicReference;
 
 import lombok.Getter;
@@ -287,7 +288,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
   }
 
-  private final Object lock = new Object(); // used as a lock for the data that follows
+  private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+  private final Object txCacheLock = new Object(); // separate lock for TerminologyCache
   protected String version; // although the internal resources are all R5, the version of FHIR they describe may not be 
 
   private boolean minimalMemory = false;
@@ -384,7 +386,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   protected void copy(BaseWorkerContext other) {
-    synchronized (other.lock) { // tricky, because you need to lock this as well, but it's really not in use yet 
+    other.rwLock.readLock().lock();
+    try {
+      // tricky, because you need to lock this as well, but it's really not in use yet 
       allResourcesById.putAll(other.allResourcesById);
       codeSystems.copy(other.codeSystems);
       valueSets.copy(other.valueSets);
@@ -437,6 +441,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       cachingAllowed = other.cachingAllowed;
       suppressedMappings = other.suppressedMappings;
       cutils.setSuppressedMappings(other.suppressedMappings);
+    } finally {
+      other.rwLock.readLock().unlock();
     }
   }
   
@@ -448,7 +454,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   public void registerResourceFromPackage(CanonicalResourceProxy r, PackageInformation packageInfo) throws FHIRException {
     PackageHackerR5.fixLoadedResource(r, packageInfo);
 
-    synchronized (lock) {
+    rwLock.writeLock().lock();
+    try {
       if (packageInfo != null) {
         packages.put(packageInfo.getVID(), packageInfo);
       }
@@ -536,12 +543,15 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         actors.register(r, packageInfo);
         break;
       }
+    } finally {
+      rwLock.writeLock().unlock();
     }
   }
 
   public void cacheResourceFromPackage(Resource r, PackageInformation packageInfo) throws FHIRException {
 
-    synchronized (lock) {   
+    rwLock.writeLock().lock();
+    try {
       if (packageInfo != null) {
         packages.put(packageInfo.getVID(), packageInfo);
       }
@@ -658,6 +668,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
           actors.see((ActorDefinition) m, packageInfo);
         }
       }
+    } finally {
+      rwLock.writeLock().unlock();
     }
   }
 
@@ -794,14 +806,20 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return fetchCodeSystem(s, v);
     }
     CodeSystem cs;
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       cs = codeSystems.get(system);
+    } finally {
+      rwLock.readLock().unlock();
     }
     if (cs == null && locator != null) {
       locator.findResource(this, system);
-      synchronized (lock) {
+      rwLock.readLock().lock();
+      try {
         cs = codeSystems.get(system);
+      } finally {
+        rwLock.readLock().unlock();
       }
     }
     return cs;
@@ -817,13 +835,19 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return fetchCodeSystem(system);
     }
     CodeSystem cs;
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       cs = codeSystems.get(system, version);
+    } finally {
+      rwLock.readLock().unlock();
     }
     if (cs == null && locator != null) {
       locator.findResource(this, system);
-      synchronized (lock) {
+      rwLock.readLock().lock();
+      try {
         cs = codeSystems.get(system);
+      } finally {
+        rwLock.readLock().unlock();
       }
     }
     return cs;
@@ -865,7 +889,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public SystemSupportInformation getTxSupportInfo(String system, String version) throws TerminologyServiceException {
-    synchronized (lock) {
+    rwLock.writeLock().lock();
+    try {
       String vurl = CanonicalType.urlWithVersion(system, version);
       if (codeSystems.has(vurl) && codeSystems.get(vurl).getContent() != CodeSystemContentMode.NOTPRESENT) {
         return new SystemSupportInformation(true, "internal", TerminologyClientContext.LATEST_VERSION, null);
@@ -902,6 +927,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         }
       }
       return new SystemSupportInformation(false);
+    } finally {
+      rwLock.writeLock().unlock();
     }
   }
 
@@ -2261,7 +2288,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   public void initTxCache(String cachePath) throws FileNotFoundException, FHIRException, IOException {
     if (cachePath != null) {
-      txCache = new TerminologyCache(lock, cachePath);
+      txCache = new TerminologyCache(txCacheLock, cachePath);
       initTxCache(txCache);
     }
   }
@@ -2397,7 +2424,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (class_ == StructureDefinition.class) {
       uri = ProfileUtilities.sdNs(uri, null);
     }
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       if (version == null) {
         if (uri.contains("|")) {
@@ -2530,6 +2558,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         return null;
       } 
       throw new FHIRException(formatMessage(I18nConstants.NOT_DONE_YET_CANT_FETCH_, uri));
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -2558,7 +2588,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
     uri = ProfileUtilities.sdNs(uri, null);
 
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       String version = null;
       if (uri.contains("|")) {
@@ -2614,6 +2645,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         return questionnaires.getPackageInfo(uri, version);
       }         
       return null;
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
   
@@ -2626,7 +2659,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if ("StructureDefinition".equals(cls)) {
       uri = ProfileUtilities.sdNs(uri, null);
     }
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       if (version == null) {
         if (uri.contains("|")) {
@@ -2756,6 +2790,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         return null;
       } 
       throw new FHIRException(formatMessage(I18nConstants.NOT_DONE_YET_CANT_FETCH_, uri));
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -2780,7 +2816,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         throw new Error("This context is configured to not allow Iterating ValueSet resources due to performance concerns");
       }
     }
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       if (class_ == Resource.class || class_ == DomainResource.class || class_ == CanonicalResource.class || class_ == null) {
         res.addAll((List<T>) structures.getList());
@@ -2832,6 +2869,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       } else if (class_ == SearchParameter.class) {
         res.addAll((List<T>) searchParameters.getList());
       }
+    } finally {
+      rwLock.readLock().unlock();
     }
     return res;
   }
@@ -2841,7 +2880,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
     List<T> res = new ArrayList<>();
 
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
 
       if (class_ == Resource.class || class_ == DomainResource.class || class_ == CanonicalResource.class || class_ == null) {
         res.addAll((List<T>) structures.getVersionList(url));
@@ -2893,6 +2933,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       } else if (class_ == SearchParameter.class) {
         res.addAll((List<T>) searchParameters.getVersionList(url));
       }
+    } finally {
+      rwLock.readLock().unlock();
     }
     return res;
   }
@@ -2910,7 +2952,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   
   @Override
   public Resource fetchResourceById(String type, String uri) {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       String[] parts = uri.split("\\/");
       if (!Utilities.noString(type) && parts.length == 1) {
         if (allResourcesById.containsKey(type)) {
@@ -2930,6 +2973,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       } else {
         throw new Error(formatMessage(I18nConstants.UNABLE_TO_PROCESS_REQUEST_FOR_RESOURCE_FOR___, type, uri));
       }
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -3016,7 +3061,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   public void reportStatus(JsonObject json) {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       json.addProperty("codeystem-count", codeSystems.size());
       json.addProperty("valueset-count", valueSets.size());
       json.addProperty("conceptmap-count", maps.size());
@@ -3026,6 +3072,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       json.addProperty("statements-count", capstmts.size());
       json.addProperty("measures-count", measures.size());
       json.addProperty("libraries-count", libraries.size());
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -3035,7 +3083,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   public void dropResource(String fhirType, String id) {
-    synchronized (lock) {
+    rwLock.writeLock().lock();
+    try {
 
       Map<String, ResourceProxy> map = allResourcesById.get(fhirType);
       if (map == null) {
@@ -3077,6 +3126,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       } else if (fhirType.equals("Requirements")) {
         requirements.drop(id);
       }
+    } finally {
+      rwLock.writeLock().unlock();
     }
   }
 
@@ -3097,7 +3148,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   
   public String listSupportedSystems() {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       String sl = null;
       for (String s : supportedCodeSystems.keySet()) {
         SystemSupportInformation ss = supportedCodeSystems.get(s);
@@ -3106,51 +3158,71 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         }
       }
       return sl;
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
 
   public int totalCount() {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       return valueSets.size() +  maps.size() + structures.size() + transforms.size();
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
   
   public List<ConceptMap> listMaps() {
     List<ConceptMap> m = new ArrayList<ConceptMap>();
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       maps.listAll(m);
+    } finally {
+      rwLock.readLock().unlock();
     }
     return m;
   }
 
   public List<StructureDefinition> listStructures() {
     List<StructureDefinition> m = new ArrayList<StructureDefinition>();
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       structures.listAll(m);
+    } finally {
+      rwLock.readLock().unlock();
     }
     return m;
   }
 
   public List<ValueSet> listValueSets() {
     List<ValueSet> m = new ArrayList<ValueSet>();
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       valueSets.listAll(m);
+    } finally {
+      rwLock.readLock().unlock();
     }
     return m;
   }
 
   public List<CodeSystem> listCodeSystems() {
     List<CodeSystem> m = new ArrayList<CodeSystem>();
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       codeSystems.listAll(m);
+    } finally {
+      rwLock.readLock().unlock();
     }
     return m;
   }
 
   public StructureDefinition getStructure(String code) {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       return structures.get(code);
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -3173,14 +3245,20 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   public void cacheVS(JsonObject json, Map<String, ValidationResult> t) {
-    synchronized (lock) {
+    rwLock.writeLock().lock();
+    try {
       validationCache.put(json.get("url").getAsString(), t);
+    } finally {
+      rwLock.writeLock().unlock();
     }
   }
 
   public SearchParameter getSearchParameter(String code) {
-    synchronized (lock) {
+    rwLock.readLock().lock();
+    try {
       return searchParameters.get(code);
+    } finally {
+      rwLock.readLock().unlock();
     }
   }
 
@@ -3689,7 +3767,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       if (uri.contains("#")) {
         uri = uri.substring(0, uri.indexOf("#"));
       } 
-      synchronized (lock) {
+      rwLock.readLock().lock();
+      try {
         if (class_ == Resource.class || class_ == null) {
           List<ResourceProxy> list = allResourcesByUrl.get(uri);
           if (list != null) {
@@ -3765,6 +3844,8 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
             res.add((T) cr);
           } 
         }
+      } finally {
+        rwLock.readLock().unlock();
       }
     }
     return res;
