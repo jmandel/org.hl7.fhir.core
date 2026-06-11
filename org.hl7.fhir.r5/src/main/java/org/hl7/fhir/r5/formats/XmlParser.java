@@ -31654,455 +31654,244 @@ public class XmlParser extends XmlParserBase {
     }
   }
 
-  private boolean nameIsTypeName(XmlPullParser xpp, String prefix) throws IOException {  
+  // Performance: precomputed set lookup replaces the generated sequential
+  // xpp.getName().equals(prefix+"Type") chain. Semantics are identical:
+  // the element name must equal prefix immediately followed by one of these
+  // type names (case-sensitive exact match).
+  private static final java.util.Set<String> NAME_IS_TYPE_NAME_TYPES;
+  static {
+    java.util.Set<String> nameIsTypeNameTypes = new java.util.HashSet<String>();
+    nameIsTypeNameTypes.add("Address");
+    nameIsTypeNameTypes.add("Age");
+    nameIsTypeNameTypes.add("Annotation");
+    nameIsTypeNameTypes.add("Attachment");
+    nameIsTypeNameTypes.add("Availability");
+    nameIsTypeNameTypes.add("CodeableConcept");
+    nameIsTypeNameTypes.add("CodeableReference");
+    nameIsTypeNameTypes.add("Coding");
+    nameIsTypeNameTypes.add("ContactDetail");
+    nameIsTypeNameTypes.add("ContactPoint");
+    nameIsTypeNameTypes.add("Contributor");
+    nameIsTypeNameTypes.add("Count");
+    nameIsTypeNameTypes.add("DataRequirement");
+    nameIsTypeNameTypes.add("Distance");
+    nameIsTypeNameTypes.add("Dosage");
+    nameIsTypeNameTypes.add("Duration");
+    nameIsTypeNameTypes.add("ElementDefinition");
+    nameIsTypeNameTypes.add("Expression");
+    nameIsTypeNameTypes.add("ExtendedContactDetail");
+    nameIsTypeNameTypes.add("Extension");
+    nameIsTypeNameTypes.add("HumanName");
+    nameIsTypeNameTypes.add("Identifier");
+    nameIsTypeNameTypes.add("MarketingStatus");
+    nameIsTypeNameTypes.add("Meta");
+    nameIsTypeNameTypes.add("MonetaryComponent");
+    nameIsTypeNameTypes.add("Money");
+    nameIsTypeNameTypes.add("Narrative");
+    nameIsTypeNameTypes.add("ParameterDefinition");
+    nameIsTypeNameTypes.add("Period");
+    nameIsTypeNameTypes.add("ProductShelfLife");
+    nameIsTypeNameTypes.add("Quantity");
+    nameIsTypeNameTypes.add("Range");
+    nameIsTypeNameTypes.add("Ratio");
+    nameIsTypeNameTypes.add("RatioRange");
+    nameIsTypeNameTypes.add("Reference");
+    nameIsTypeNameTypes.add("RelatedArtifact");
+    nameIsTypeNameTypes.add("SampledData");
+    nameIsTypeNameTypes.add("Signature");
+    nameIsTypeNameTypes.add("Timing");
+    nameIsTypeNameTypes.add("TriggerDefinition");
+    nameIsTypeNameTypes.add("UsageContext");
+    nameIsTypeNameTypes.add("VirtualServiceDetail");
+    nameIsTypeNameTypes.add("Account");
+    nameIsTypeNameTypes.add("ActivityDefinition");
+    nameIsTypeNameTypes.add("ActorDefinition");
+    nameIsTypeNameTypes.add("AdministrableProductDefinition");
+    nameIsTypeNameTypes.add("AdverseEvent");
+    nameIsTypeNameTypes.add("AllergyIntolerance");
+    nameIsTypeNameTypes.add("Appointment");
+    nameIsTypeNameTypes.add("AppointmentResponse");
+    nameIsTypeNameTypes.add("ArtifactAssessment");
+    nameIsTypeNameTypes.add("AuditEvent");
+    nameIsTypeNameTypes.add("Basic");
+    nameIsTypeNameTypes.add("Binary");
+    nameIsTypeNameTypes.add("BiologicallyDerivedProduct");
+    nameIsTypeNameTypes.add("BiologicallyDerivedProductDispense");
+    nameIsTypeNameTypes.add("BodyStructure");
+    nameIsTypeNameTypes.add("Bundle");
+    nameIsTypeNameTypes.add("CapabilityStatement");
+    nameIsTypeNameTypes.add("CarePlan");
+    nameIsTypeNameTypes.add("CareTeam");
+    nameIsTypeNameTypes.add("ChargeItem");
+    nameIsTypeNameTypes.add("ChargeItemDefinition");
+    nameIsTypeNameTypes.add("Citation");
+    nameIsTypeNameTypes.add("Claim");
+    nameIsTypeNameTypes.add("ClaimResponse");
+    nameIsTypeNameTypes.add("ClinicalImpression");
+    nameIsTypeNameTypes.add("ClinicalUseDefinition");
+    nameIsTypeNameTypes.add("CodeSystem");
+    nameIsTypeNameTypes.add("Communication");
+    nameIsTypeNameTypes.add("CommunicationRequest");
+    nameIsTypeNameTypes.add("CompartmentDefinition");
+    nameIsTypeNameTypes.add("Composition");
+    nameIsTypeNameTypes.add("ConceptMap");
+    nameIsTypeNameTypes.add("Condition");
+    nameIsTypeNameTypes.add("ConditionDefinition");
+    nameIsTypeNameTypes.add("Consent");
+    nameIsTypeNameTypes.add("Contract");
+    nameIsTypeNameTypes.add("Coverage");
+    nameIsTypeNameTypes.add("CoverageEligibilityRequest");
+    nameIsTypeNameTypes.add("CoverageEligibilityResponse");
+    nameIsTypeNameTypes.add("DetectedIssue");
+    nameIsTypeNameTypes.add("Device");
+    nameIsTypeNameTypes.add("DeviceAssociation");
+    nameIsTypeNameTypes.add("DeviceDefinition");
+    nameIsTypeNameTypes.add("DeviceDispense");
+    nameIsTypeNameTypes.add("DeviceMetric");
+    nameIsTypeNameTypes.add("DeviceRequest");
+    nameIsTypeNameTypes.add("DeviceUsage");
+    nameIsTypeNameTypes.add("DiagnosticReport");
+    nameIsTypeNameTypes.add("DocumentReference");
+    nameIsTypeNameTypes.add("Encounter");
+    nameIsTypeNameTypes.add("EncounterHistory");
+    nameIsTypeNameTypes.add("Endpoint");
+    nameIsTypeNameTypes.add("EnrollmentRequest");
+    nameIsTypeNameTypes.add("EnrollmentResponse");
+    nameIsTypeNameTypes.add("EpisodeOfCare");
+    nameIsTypeNameTypes.add("EventDefinition");
+    nameIsTypeNameTypes.add("Evidence");
+    nameIsTypeNameTypes.add("EvidenceReport");
+    nameIsTypeNameTypes.add("EvidenceVariable");
+    nameIsTypeNameTypes.add("ExampleScenario");
+    nameIsTypeNameTypes.add("ExplanationOfBenefit");
+    nameIsTypeNameTypes.add("FamilyMemberHistory");
+    nameIsTypeNameTypes.add("Flag");
+    nameIsTypeNameTypes.add("FormularyItem");
+    nameIsTypeNameTypes.add("GenomicStudy");
+    nameIsTypeNameTypes.add("Goal");
+    nameIsTypeNameTypes.add("GraphDefinition");
+    nameIsTypeNameTypes.add("Group");
+    nameIsTypeNameTypes.add("GuidanceResponse");
+    nameIsTypeNameTypes.add("HealthcareService");
+    nameIsTypeNameTypes.add("ImagingSelection");
+    nameIsTypeNameTypes.add("ImagingStudy");
+    nameIsTypeNameTypes.add("Immunization");
+    nameIsTypeNameTypes.add("ImmunizationEvaluation");
+    nameIsTypeNameTypes.add("ImmunizationRecommendation");
+    nameIsTypeNameTypes.add("ImplementationGuide");
+    nameIsTypeNameTypes.add("Ingredient");
+    nameIsTypeNameTypes.add("InsurancePlan");
+    nameIsTypeNameTypes.add("InventoryItem");
+    nameIsTypeNameTypes.add("InventoryReport");
+    nameIsTypeNameTypes.add("Invoice");
+    nameIsTypeNameTypes.add("Library");
+    nameIsTypeNameTypes.add("Linkage");
+    nameIsTypeNameTypes.add("List");
+    nameIsTypeNameTypes.add("Location");
+    nameIsTypeNameTypes.add("ManufacturedItemDefinition");
+    nameIsTypeNameTypes.add("Measure");
+    nameIsTypeNameTypes.add("MeasureReport");
+    nameIsTypeNameTypes.add("Medication");
+    nameIsTypeNameTypes.add("MedicationAdministration");
+    nameIsTypeNameTypes.add("MedicationDispense");
+    nameIsTypeNameTypes.add("MedicationKnowledge");
+    nameIsTypeNameTypes.add("MedicationRequest");
+    nameIsTypeNameTypes.add("MedicationStatement");
+    nameIsTypeNameTypes.add("MedicinalProductDefinition");
+    nameIsTypeNameTypes.add("MessageDefinition");
+    nameIsTypeNameTypes.add("MessageHeader");
+    nameIsTypeNameTypes.add("MolecularSequence");
+    nameIsTypeNameTypes.add("NamingSystem");
+    nameIsTypeNameTypes.add("NutritionIntake");
+    nameIsTypeNameTypes.add("NutritionOrder");
+    nameIsTypeNameTypes.add("NutritionProduct");
+    nameIsTypeNameTypes.add("Observation");
+    nameIsTypeNameTypes.add("ObservationDefinition");
+    nameIsTypeNameTypes.add("OperationDefinition");
+    nameIsTypeNameTypes.add("OperationOutcome");
+    nameIsTypeNameTypes.add("Organization");
+    nameIsTypeNameTypes.add("OrganizationAffiliation");
+    nameIsTypeNameTypes.add("PackagedProductDefinition");
+    nameIsTypeNameTypes.add("Parameters");
+    nameIsTypeNameTypes.add("Patient");
+    nameIsTypeNameTypes.add("PaymentNotice");
+    nameIsTypeNameTypes.add("PaymentReconciliation");
+    nameIsTypeNameTypes.add("Permission");
+    nameIsTypeNameTypes.add("Person");
+    nameIsTypeNameTypes.add("PlanDefinition");
+    nameIsTypeNameTypes.add("Practitioner");
+    nameIsTypeNameTypes.add("PractitionerRole");
+    nameIsTypeNameTypes.add("Procedure");
+    nameIsTypeNameTypes.add("Provenance");
+    nameIsTypeNameTypes.add("Questionnaire");
+    nameIsTypeNameTypes.add("QuestionnaireResponse");
+    nameIsTypeNameTypes.add("RegulatedAuthorization");
+    nameIsTypeNameTypes.add("RelatedPerson");
+    nameIsTypeNameTypes.add("RequestOrchestration");
+    nameIsTypeNameTypes.add("Requirements");
+    nameIsTypeNameTypes.add("ResearchStudy");
+    nameIsTypeNameTypes.add("ResearchSubject");
+    nameIsTypeNameTypes.add("RiskAssessment");
+    nameIsTypeNameTypes.add("Schedule");
+    nameIsTypeNameTypes.add("SearchParameter");
+    nameIsTypeNameTypes.add("ServiceRequest");
+    nameIsTypeNameTypes.add("Slot");
+    nameIsTypeNameTypes.add("Specimen");
+    nameIsTypeNameTypes.add("SpecimenDefinition");
+    nameIsTypeNameTypes.add("StructureDefinition");
+    nameIsTypeNameTypes.add("StructureMap");
+    nameIsTypeNameTypes.add("Subscription");
+    nameIsTypeNameTypes.add("SubscriptionStatus");
+    nameIsTypeNameTypes.add("SubscriptionTopic");
+    nameIsTypeNameTypes.add("Substance");
+    nameIsTypeNameTypes.add("SubstanceDefinition");
+    nameIsTypeNameTypes.add("SubstanceNucleicAcid");
+    nameIsTypeNameTypes.add("SubstancePolymer");
+    nameIsTypeNameTypes.add("SubstanceProtein");
+    nameIsTypeNameTypes.add("SubstanceReferenceInformation");
+    nameIsTypeNameTypes.add("SubstanceSourceMaterial");
+    nameIsTypeNameTypes.add("SupplyDelivery");
+    nameIsTypeNameTypes.add("SupplyRequest");
+    nameIsTypeNameTypes.add("Task");
+    nameIsTypeNameTypes.add("TerminologyCapabilities");
+    nameIsTypeNameTypes.add("TestPlan");
+    nameIsTypeNameTypes.add("TestReport");
+    nameIsTypeNameTypes.add("TestScript");
+    nameIsTypeNameTypes.add("Transport");
+    nameIsTypeNameTypes.add("ValueSet");
+    nameIsTypeNameTypes.add("VerificationResult");
+    nameIsTypeNameTypes.add("VisionPrescription");
+    nameIsTypeNameTypes.add("Date");
+    nameIsTypeNameTypes.add("DateTime");
+    nameIsTypeNameTypes.add("Code");
+    nameIsTypeNameTypes.add("String");
+    nameIsTypeNameTypes.add("Integer");
+    nameIsTypeNameTypes.add("Integer64");
+    nameIsTypeNameTypes.add("Oid");
+    nameIsTypeNameTypes.add("Canonical");
+    nameIsTypeNameTypes.add("Uri");
+    nameIsTypeNameTypes.add("Uuid");
+    nameIsTypeNameTypes.add("Url");
+    nameIsTypeNameTypes.add("Instant");
+    nameIsTypeNameTypes.add("Boolean");
+    nameIsTypeNameTypes.add("Base64Binary");
+    nameIsTypeNameTypes.add("UnsignedInt");
+    nameIsTypeNameTypes.add("Markdown");
+    nameIsTypeNameTypes.add("Time");
+    nameIsTypeNameTypes.add("Id");
+    nameIsTypeNameTypes.add("PositiveInt");
+    nameIsTypeNameTypes.add("Decimal");
+    NAME_IS_TYPE_NAME_TYPES = java.util.Collections.unmodifiableSet(nameIsTypeNameTypes);
+  }
+
+  private boolean nameIsTypeName(XmlPullParser xpp, String prefix) throws IOException {
     if (prefix == null) {
       throw new IOException("prefix == null!");
     } else if (xpp == null) {
       throw new IOException("xpp == null!");
-    } else if (xpp.getName().equals(prefix+"Address")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Age")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Annotation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Attachment")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Availability")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CodeableConcept")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CodeableReference")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Coding")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ContactDetail")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ContactPoint")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Contributor")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Count")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DataRequirement")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Distance")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Dosage")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Duration")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ElementDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Expression")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ExtendedContactDetail")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Extension")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"HumanName")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Identifier")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MarketingStatus")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Meta")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MonetaryComponent")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Money")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Narrative")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ParameterDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Period")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ProductShelfLife")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Quantity")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Range")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Ratio")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RatioRange")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Reference")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RelatedArtifact")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SampledData")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Signature")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Timing")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"TriggerDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"UsageContext")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"VirtualServiceDetail")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Account")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ActivityDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ActorDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"AdministrableProductDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"AdverseEvent")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"AllergyIntolerance")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Appointment")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"AppointmentResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ArtifactAssessment")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"AuditEvent")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Basic")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Binary")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"BiologicallyDerivedProduct")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"BiologicallyDerivedProductDispense")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"BodyStructure")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Bundle")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CapabilityStatement")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CarePlan")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CareTeam")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ChargeItem")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ChargeItemDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Citation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Claim")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ClaimResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ClinicalImpression")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ClinicalUseDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CodeSystem")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Communication")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CommunicationRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CompartmentDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Composition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ConceptMap")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Condition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ConditionDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Consent")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Contract")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Coverage")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CoverageEligibilityRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"CoverageEligibilityResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DetectedIssue")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Device")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceAssociation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceDispense")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceMetric")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DeviceUsage")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DiagnosticReport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DocumentReference")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Encounter")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EncounterHistory")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Endpoint")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EnrollmentRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EnrollmentResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EpisodeOfCare")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EventDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Evidence")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EvidenceReport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"EvidenceVariable")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ExampleScenario")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ExplanationOfBenefit")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"FamilyMemberHistory")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Flag")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"FormularyItem")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"GenomicStudy")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Goal")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"GraphDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Group")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"GuidanceResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"HealthcareService")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ImagingSelection")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ImagingStudy")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Immunization")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ImmunizationEvaluation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ImmunizationRecommendation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ImplementationGuide")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Ingredient")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"InsurancePlan")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"InventoryItem")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"InventoryReport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Invoice")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Library")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Linkage")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"List")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Location")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ManufacturedItemDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Measure")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MeasureReport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Medication")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicationAdministration")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicationDispense")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicationKnowledge")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicationRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicationStatement")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MedicinalProductDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MessageDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MessageHeader")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"MolecularSequence")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"NamingSystem")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"NutritionIntake")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"NutritionOrder")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"NutritionProduct")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Observation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ObservationDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"OperationDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"OperationOutcome")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Organization")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"OrganizationAffiliation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PackagedProductDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Parameters")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Patient")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PaymentNotice")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PaymentReconciliation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Permission")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Person")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PlanDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Practitioner")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PractitionerRole")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Procedure")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Provenance")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Questionnaire")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"QuestionnaireResponse")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RegulatedAuthorization")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RelatedPerson")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RequestOrchestration")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Requirements")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ResearchStudy")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ResearchSubject")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"RiskAssessment")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Schedule")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SearchParameter")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ServiceRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Slot")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Specimen")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SpecimenDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"StructureDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"StructureMap")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Subscription")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubscriptionStatus")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubscriptionTopic")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Substance")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstanceDefinition")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstanceNucleicAcid")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstancePolymer")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstanceProtein")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstanceReferenceInformation")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SubstanceSourceMaterial")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SupplyDelivery")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"SupplyRequest")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Task")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"TerminologyCapabilities")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"TestPlan")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"TestReport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"TestScript")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Transport")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"ValueSet")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"VerificationResult")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"VisionPrescription")) {
-      return true;
-
-    } else if (xpp.getName().equals(prefix+"Date")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"DateTime")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Code")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"String")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Integer")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Integer64")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Oid")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Canonical")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Uri")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Uuid")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Url")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Instant")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Boolean")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Base64Binary")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"UnsignedInt")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Markdown")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Time")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Id")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"PositiveInt")) {
-      return true;
-    } else if (xpp.getName().equals(prefix+"Decimal")) {
-      return true;
-    } else {
-      return false;
     }
+    String name = xpp.getName();
+    return name.startsWith(prefix) && NAME_IS_TYPE_NAME_TYPES.contains(name.substring(prefix.length()));
   }
 
   @Override

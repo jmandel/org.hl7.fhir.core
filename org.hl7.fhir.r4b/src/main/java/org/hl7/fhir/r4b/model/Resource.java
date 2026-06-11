@@ -515,7 +515,10 @@ public abstract class Resource extends BaseResource implements IAnyResource {
   }
 
   public boolean isEmpty() {
-    return super.isEmpty() && ca.uhn.fhir.util.ElementUtil.isEmpty(id, meta, implicitRules, language);
+    // Performance: equivalent to ca.uhn.fhir.util.ElementUtil.isEmpty(id, meta, implicitRules, language)
+    // without the IBase[] varargs allocation on this hot path
+    return super.isEmpty() && (id == null || id.isEmpty()) && (meta == null || meta.isEmpty())
+       && (implicitRules == null || implicitRules.isEmpty()) && (language == null || language.isEmpty());
   }
 
 // Manual code (from Configuration.txt):

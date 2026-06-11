@@ -515,7 +515,10 @@ public abstract class DomainResource extends Resource
   }
 
   public boolean isEmpty() {
-    return super.isEmpty() && ca.uhn.fhir.util.ElementUtil.isEmpty(text, contained, extension, modifierExtension);
+    // Performance: equivalent to ca.uhn.fhir.util.ElementUtil.isEmpty(text, contained, extension, modifierExtension)
+    // without the Object[] varargs allocation and instanceof dispatch on this hot path
+    return super.isEmpty() && (text == null || text.isEmpty()) && ca.uhn.fhir.util.ElementUtil.isEmpty(contained)
+       && ca.uhn.fhir.util.ElementUtil.isEmpty(extension) && ca.uhn.fhir.util.ElementUtil.isEmpty(modifierExtension);
   }
 
   /**

@@ -309,7 +309,9 @@ public abstract class Element extends Base implements IBaseHasExtensions, IBaseE
       }
 
       public boolean isEmpty() {
-        return super.isEmpty() && ca.uhn.fhir.util.ElementUtil.isEmpty(id, extension);
+        // Performance: equivalent to ca.uhn.fhir.util.ElementUtil.isEmpty(id, extension)
+        // without the Object[] varargs allocation and instanceof dispatch on this hot path
+        return super.isEmpty() && (id == null || id.isEmpty()) && ca.uhn.fhir.util.ElementUtil.isEmpty(extension);
       }
 
 // Manual code (from Configuration.txt):
