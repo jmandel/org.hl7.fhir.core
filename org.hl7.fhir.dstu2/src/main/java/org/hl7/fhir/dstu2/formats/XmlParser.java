@@ -11134,278 +11134,154 @@ public class XmlParser extends XmlParserBase {
     throw new FHIRFormatError("Unknown type " + type);
   }
 
+  // Performance: precomputed set lookup replaces the generated sequential
+  // xpp.getName().equals(prefix+"Type") chain. Semantics are identical:
+  // the element name must equal prefix immediately followed by one of these
+  // type names (case-sensitive exact match).
+  private static final java.util.Set<String> NAME_IS_TYPE_NAME_TYPES;
+  static {
+    java.util.Set<String> nameIsTypeNameTypes = new java.util.HashSet<String>();
+    nameIsTypeNameTypes.add("Identifier");
+    nameIsTypeNameTypes.add("Coding");
+    nameIsTypeNameTypes.add("Reference");
+    nameIsTypeNameTypes.add("Signature");
+    nameIsTypeNameTypes.add("SampledData");
+    nameIsTypeNameTypes.add("Quantity");
+    nameIsTypeNameTypes.add("Period");
+    nameIsTypeNameTypes.add("Attachment");
+    nameIsTypeNameTypes.add("Ratio");
+    nameIsTypeNameTypes.add("Range");
+    nameIsTypeNameTypes.add("Annotation");
+    nameIsTypeNameTypes.add("CodeableConcept");
+    nameIsTypeNameTypes.add("Money");
+    nameIsTypeNameTypes.add("SimpleQuantity");
+    nameIsTypeNameTypes.add("Duration");
+    nameIsTypeNameTypes.add("Count");
+    nameIsTypeNameTypes.add("Distance");
+    nameIsTypeNameTypes.add("Age");
+    nameIsTypeNameTypes.add("HumanName");
+    nameIsTypeNameTypes.add("ContactPoint");
+    nameIsTypeNameTypes.add("Meta");
+    nameIsTypeNameTypes.add("Address");
+    nameIsTypeNameTypes.add("Timing");
+    nameIsTypeNameTypes.add("ElementDefinition");
+    nameIsTypeNameTypes.add("Parameters");
+    nameIsTypeNameTypes.add("Account");
+    nameIsTypeNameTypes.add("AllergyIntolerance");
+    nameIsTypeNameTypes.add("Appointment");
+    nameIsTypeNameTypes.add("AppointmentResponse");
+    nameIsTypeNameTypes.add("AuditEvent");
+    nameIsTypeNameTypes.add("Basic");
+    nameIsTypeNameTypes.add("Binary");
+    nameIsTypeNameTypes.add("BodySite");
+    nameIsTypeNameTypes.add("Bundle");
+    nameIsTypeNameTypes.add("CarePlan");
+    nameIsTypeNameTypes.add("Claim");
+    nameIsTypeNameTypes.add("ClaimResponse");
+    nameIsTypeNameTypes.add("ClinicalImpression");
+    nameIsTypeNameTypes.add("Communication");
+    nameIsTypeNameTypes.add("CommunicationRequest");
+    nameIsTypeNameTypes.add("Composition");
+    nameIsTypeNameTypes.add("ConceptMap");
+    nameIsTypeNameTypes.add("Condition");
+    nameIsTypeNameTypes.add("Conformance");
+    nameIsTypeNameTypes.add("Contract");
+    nameIsTypeNameTypes.add("Coverage");
+    nameIsTypeNameTypes.add("DataElement");
+    nameIsTypeNameTypes.add("DetectedIssue");
+    nameIsTypeNameTypes.add("Device");
+    nameIsTypeNameTypes.add("DeviceComponent");
+    nameIsTypeNameTypes.add("DeviceMetric");
+    nameIsTypeNameTypes.add("DeviceUseRequest");
+    nameIsTypeNameTypes.add("DeviceUseStatement");
+    nameIsTypeNameTypes.add("DiagnosticOrder");
+    nameIsTypeNameTypes.add("DiagnosticReport");
+    nameIsTypeNameTypes.add("DocumentManifest");
+    nameIsTypeNameTypes.add("DocumentReference");
+    nameIsTypeNameTypes.add("EligibilityRequest");
+    nameIsTypeNameTypes.add("EligibilityResponse");
+    nameIsTypeNameTypes.add("Encounter");
+    nameIsTypeNameTypes.add("EnrollmentRequest");
+    nameIsTypeNameTypes.add("EnrollmentResponse");
+    nameIsTypeNameTypes.add("EpisodeOfCare");
+    nameIsTypeNameTypes.add("ExplanationOfBenefit");
+    nameIsTypeNameTypes.add("FamilyMemberHistory");
+    nameIsTypeNameTypes.add("Flag");
+    nameIsTypeNameTypes.add("Goal");
+    nameIsTypeNameTypes.add("Group");
+    nameIsTypeNameTypes.add("HealthcareService");
+    nameIsTypeNameTypes.add("ImagingObjectSelection");
+    nameIsTypeNameTypes.add("ImagingStudy");
+    nameIsTypeNameTypes.add("Immunization");
+    nameIsTypeNameTypes.add("ImmunizationRecommendation");
+    nameIsTypeNameTypes.add("ImplementationGuide");
+    nameIsTypeNameTypes.add("List");
+    nameIsTypeNameTypes.add("Location");
+    nameIsTypeNameTypes.add("Media");
+    nameIsTypeNameTypes.add("Medication");
+    nameIsTypeNameTypes.add("MedicationAdministration");
+    nameIsTypeNameTypes.add("MedicationDispense");
+    nameIsTypeNameTypes.add("MedicationOrder");
+    nameIsTypeNameTypes.add("MedicationStatement");
+    nameIsTypeNameTypes.add("MessageHeader");
+    nameIsTypeNameTypes.add("NamingSystem");
+    nameIsTypeNameTypes.add("NutritionOrder");
+    nameIsTypeNameTypes.add("Observation");
+    nameIsTypeNameTypes.add("OperationDefinition");
+    nameIsTypeNameTypes.add("OperationOutcome");
+    nameIsTypeNameTypes.add("Order");
+    nameIsTypeNameTypes.add("OrderResponse");
+    nameIsTypeNameTypes.add("Organization");
+    nameIsTypeNameTypes.add("Patient");
+    nameIsTypeNameTypes.add("PaymentNotice");
+    nameIsTypeNameTypes.add("PaymentReconciliation");
+    nameIsTypeNameTypes.add("Person");
+    nameIsTypeNameTypes.add("Practitioner");
+    nameIsTypeNameTypes.add("Procedure");
+    nameIsTypeNameTypes.add("ProcedureRequest");
+    nameIsTypeNameTypes.add("ProcessRequest");
+    nameIsTypeNameTypes.add("ProcessResponse");
+    nameIsTypeNameTypes.add("Provenance");
+    nameIsTypeNameTypes.add("Questionnaire");
+    nameIsTypeNameTypes.add("QuestionnaireResponse");
+    nameIsTypeNameTypes.add("ReferralRequest");
+    nameIsTypeNameTypes.add("RelatedPerson");
+    nameIsTypeNameTypes.add("RiskAssessment");
+    nameIsTypeNameTypes.add("Schedule");
+    nameIsTypeNameTypes.add("SearchParameter");
+    nameIsTypeNameTypes.add("Slot");
+    nameIsTypeNameTypes.add("Specimen");
+    nameIsTypeNameTypes.add("StructureDefinition");
+    nameIsTypeNameTypes.add("Subscription");
+    nameIsTypeNameTypes.add("Substance");
+    nameIsTypeNameTypes.add("SupplyDelivery");
+    nameIsTypeNameTypes.add("SupplyRequest");
+    nameIsTypeNameTypes.add("TestScript");
+    nameIsTypeNameTypes.add("ValueSet");
+    nameIsTypeNameTypes.add("VisionPrescription");
+    nameIsTypeNameTypes.add("Date");
+    nameIsTypeNameTypes.add("DateTime");
+    nameIsTypeNameTypes.add("Code");
+    nameIsTypeNameTypes.add("String");
+    nameIsTypeNameTypes.add("Integer");
+    nameIsTypeNameTypes.add("Oid");
+    nameIsTypeNameTypes.add("Uri");
+    nameIsTypeNameTypes.add("Uuid");
+    nameIsTypeNameTypes.add("Instant");
+    nameIsTypeNameTypes.add("Boolean");
+    nameIsTypeNameTypes.add("Base64Binary");
+    nameIsTypeNameTypes.add("UnsignedInt");
+    nameIsTypeNameTypes.add("Markdown");
+    nameIsTypeNameTypes.add("Time");
+    nameIsTypeNameTypes.add("Id");
+    nameIsTypeNameTypes.add("PositiveInt");
+    nameIsTypeNameTypes.add("Decimal");
+    NAME_IS_TYPE_NAME_TYPES = java.util.Collections.unmodifiableSet(nameIsTypeNameTypes);
+  }
+
   private boolean nameIsTypeName(XmlPullParser xpp, String prefix) {
-    if (xpp.getName().equals(prefix + "Identifier"))
-      return true;
-    if (xpp.getName().equals(prefix + "Coding"))
-      return true;
-    if (xpp.getName().equals(prefix + "Reference"))
-      return true;
-    if (xpp.getName().equals(prefix + "Signature"))
-      return true;
-    if (xpp.getName().equals(prefix + "SampledData"))
-      return true;
-    if (xpp.getName().equals(prefix + "Quantity"))
-      return true;
-    if (xpp.getName().equals(prefix + "Period"))
-      return true;
-    if (xpp.getName().equals(prefix + "Attachment"))
-      return true;
-    if (xpp.getName().equals(prefix + "Ratio"))
-      return true;
-    if (xpp.getName().equals(prefix + "Range"))
-      return true;
-    if (xpp.getName().equals(prefix + "Annotation"))
-      return true;
-    if (xpp.getName().equals(prefix + "CodeableConcept"))
-      return true;
-    if (xpp.getName().equals(prefix + "Money"))
-      return true;
-    if (xpp.getName().equals(prefix + "SimpleQuantity"))
-      return true;
-    if (xpp.getName().equals(prefix + "Duration"))
-      return true;
-    if (xpp.getName().equals(prefix + "Count"))
-      return true;
-    if (xpp.getName().equals(prefix + "Distance"))
-      return true;
-    if (xpp.getName().equals(prefix + "Age"))
-      return true;
-    if (xpp.getName().equals(prefix + "HumanName"))
-      return true;
-    if (xpp.getName().equals(prefix + "ContactPoint"))
-      return true;
-    if (xpp.getName().equals(prefix + "Meta"))
-      return true;
-    if (xpp.getName().equals(prefix + "Address"))
-      return true;
-    if (xpp.getName().equals(prefix + "Timing"))
-      return true;
-    if (xpp.getName().equals(prefix + "ElementDefinition"))
-      return true;
-    if (xpp.getName().equals(prefix + "Parameters"))
-      return true;
-    if (xpp.getName().equals(prefix + "Account"))
-      return true;
-    if (xpp.getName().equals(prefix + "AllergyIntolerance"))
-      return true;
-    if (xpp.getName().equals(prefix + "Appointment"))
-      return true;
-    if (xpp.getName().equals(prefix + "AppointmentResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "AuditEvent"))
-      return true;
-    if (xpp.getName().equals(prefix + "Basic"))
-      return true;
-    if (xpp.getName().equals(prefix + "Binary"))
-      return true;
-    if (xpp.getName().equals(prefix + "BodySite"))
-      return true;
-    if (xpp.getName().equals(prefix + "Bundle"))
-      return true;
-    if (xpp.getName().equals(prefix + "CarePlan"))
-      return true;
-    if (xpp.getName().equals(prefix + "Claim"))
-      return true;
-    if (xpp.getName().equals(prefix + "ClaimResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "ClinicalImpression"))
-      return true;
-    if (xpp.getName().equals(prefix + "Communication"))
-      return true;
-    if (xpp.getName().equals(prefix + "CommunicationRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "Composition"))
-      return true;
-    if (xpp.getName().equals(prefix + "ConceptMap"))
-      return true;
-    if (xpp.getName().equals(prefix + "Condition"))
-      return true;
-    if (xpp.getName().equals(prefix + "Conformance"))
-      return true;
-    if (xpp.getName().equals(prefix + "Contract"))
-      return true;
-    if (xpp.getName().equals(prefix + "Coverage"))
-      return true;
-    if (xpp.getName().equals(prefix + "DataElement"))
-      return true;
-    if (xpp.getName().equals(prefix + "DetectedIssue"))
-      return true;
-    if (xpp.getName().equals(prefix + "Device"))
-      return true;
-    if (xpp.getName().equals(prefix + "DeviceComponent"))
-      return true;
-    if (xpp.getName().equals(prefix + "DeviceMetric"))
-      return true;
-    if (xpp.getName().equals(prefix + "DeviceUseRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "DeviceUseStatement"))
-      return true;
-    if (xpp.getName().equals(prefix + "DiagnosticOrder"))
-      return true;
-    if (xpp.getName().equals(prefix + "DiagnosticReport"))
-      return true;
-    if (xpp.getName().equals(prefix + "DocumentManifest"))
-      return true;
-    if (xpp.getName().equals(prefix + "DocumentReference"))
-      return true;
-    if (xpp.getName().equals(prefix + "EligibilityRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "EligibilityResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "Encounter"))
-      return true;
-    if (xpp.getName().equals(prefix + "EnrollmentRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "EnrollmentResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "EpisodeOfCare"))
-      return true;
-    if (xpp.getName().equals(prefix + "ExplanationOfBenefit"))
-      return true;
-    if (xpp.getName().equals(prefix + "FamilyMemberHistory"))
-      return true;
-    if (xpp.getName().equals(prefix + "Flag"))
-      return true;
-    if (xpp.getName().equals(prefix + "Goal"))
-      return true;
-    if (xpp.getName().equals(prefix + "Group"))
-      return true;
-    if (xpp.getName().equals(prefix + "HealthcareService"))
-      return true;
-    if (xpp.getName().equals(prefix + "ImagingObjectSelection"))
-      return true;
-    if (xpp.getName().equals(prefix + "ImagingStudy"))
-      return true;
-    if (xpp.getName().equals(prefix + "Immunization"))
-      return true;
-    if (xpp.getName().equals(prefix + "ImmunizationRecommendation"))
-      return true;
-    if (xpp.getName().equals(prefix + "ImplementationGuide"))
-      return true;
-    if (xpp.getName().equals(prefix + "List"))
-      return true;
-    if (xpp.getName().equals(prefix + "Location"))
-      return true;
-    if (xpp.getName().equals(prefix + "Media"))
-      return true;
-    if (xpp.getName().equals(prefix + "Medication"))
-      return true;
-    if (xpp.getName().equals(prefix + "MedicationAdministration"))
-      return true;
-    if (xpp.getName().equals(prefix + "MedicationDispense"))
-      return true;
-    if (xpp.getName().equals(prefix + "MedicationOrder"))
-      return true;
-    if (xpp.getName().equals(prefix + "MedicationStatement"))
-      return true;
-    if (xpp.getName().equals(prefix + "MessageHeader"))
-      return true;
-    if (xpp.getName().equals(prefix + "NamingSystem"))
-      return true;
-    if (xpp.getName().equals(prefix + "NutritionOrder"))
-      return true;
-    if (xpp.getName().equals(prefix + "Observation"))
-      return true;
-    if (xpp.getName().equals(prefix + "OperationDefinition"))
-      return true;
-    if (xpp.getName().equals(prefix + "OperationOutcome"))
-      return true;
-    if (xpp.getName().equals(prefix + "Order"))
-      return true;
-    if (xpp.getName().equals(prefix + "OrderResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "Organization"))
-      return true;
-    if (xpp.getName().equals(prefix + "Patient"))
-      return true;
-    if (xpp.getName().equals(prefix + "PaymentNotice"))
-      return true;
-    if (xpp.getName().equals(prefix + "PaymentReconciliation"))
-      return true;
-    if (xpp.getName().equals(prefix + "Person"))
-      return true;
-    if (xpp.getName().equals(prefix + "Practitioner"))
-      return true;
-    if (xpp.getName().equals(prefix + "Procedure"))
-      return true;
-    if (xpp.getName().equals(prefix + "ProcedureRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "ProcessRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "ProcessResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "Provenance"))
-      return true;
-    if (xpp.getName().equals(prefix + "Questionnaire"))
-      return true;
-    if (xpp.getName().equals(prefix + "QuestionnaireResponse"))
-      return true;
-    if (xpp.getName().equals(prefix + "ReferralRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "RelatedPerson"))
-      return true;
-    if (xpp.getName().equals(prefix + "RiskAssessment"))
-      return true;
-    if (xpp.getName().equals(prefix + "Schedule"))
-      return true;
-    if (xpp.getName().equals(prefix + "SearchParameter"))
-      return true;
-    if (xpp.getName().equals(prefix + "Slot"))
-      return true;
-    if (xpp.getName().equals(prefix + "Specimen"))
-      return true;
-    if (xpp.getName().equals(prefix + "StructureDefinition"))
-      return true;
-    if (xpp.getName().equals(prefix + "Subscription"))
-      return true;
-    if (xpp.getName().equals(prefix + "Substance"))
-      return true;
-    if (xpp.getName().equals(prefix + "SupplyDelivery"))
-      return true;
-    if (xpp.getName().equals(prefix + "SupplyRequest"))
-      return true;
-    if (xpp.getName().equals(prefix + "TestScript"))
-      return true;
-    if (xpp.getName().equals(prefix + "ValueSet"))
-      return true;
-    if (xpp.getName().equals(prefix + "VisionPrescription"))
-      return true;
-    if (xpp.getName().equals(prefix + "Date"))
-      return true;
-    if (xpp.getName().equals(prefix + "DateTime"))
-      return true;
-    if (xpp.getName().equals(prefix + "Code"))
-      return true;
-    if (xpp.getName().equals(prefix + "String"))
-      return true;
-    if (xpp.getName().equals(prefix + "Integer"))
-      return true;
-    if (xpp.getName().equals(prefix + "Oid"))
-      return true;
-    if (xpp.getName().equals(prefix + "Uri"))
-      return true;
-    if (xpp.getName().equals(prefix + "Uuid"))
-      return true;
-    if (xpp.getName().equals(prefix + "Instant"))
-      return true;
-    if (xpp.getName().equals(prefix + "Boolean"))
-      return true;
-    if (xpp.getName().equals(prefix + "Base64Binary"))
-      return true;
-    if (xpp.getName().equals(prefix + "UnsignedInt"))
-      return true;
-    if (xpp.getName().equals(prefix + "Markdown"))
-      return true;
-    if (xpp.getName().equals(prefix + "Time"))
-      return true;
-    if (xpp.getName().equals(prefix + "Id"))
-      return true;
-    if (xpp.getName().equals(prefix + "PositiveInt"))
-      return true;
-    if (xpp.getName().equals(prefix + "Decimal"))
-      return true;
-    return false;
+    String name = xpp.getName();
+    return name.startsWith(prefix) && NAME_IS_TYPE_NAME_TYPES.contains(name.substring(prefix.length()));
   }
 
   protected void composeElementElements(Element element) throws IOException {
