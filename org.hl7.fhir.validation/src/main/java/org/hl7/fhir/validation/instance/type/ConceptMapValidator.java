@@ -208,6 +208,10 @@ public class ConceptMapValidator extends BaseValidator {
               warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM, cv.getCoding().getSystem(), cv.getCoding().getCode(), null);
             } else if (cv.getResult().getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED_VERSION) {
               warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM_VERSION, cv.getCoding().getSystem(), cv.getCoding().getCode(), null, cv.getResult().getVersion());
+            } else if (cv.getResult().getErrorClass() == TerminologyServiceErrorClass.NOSERVICE || cv.getResult().getErrorClass() == TerminologyServiceErrorClass.SERVER_ERROR) {
+              // a terminology infrastructure failure (no server / server error) must never masquerade as
+              // "code X is not valid in the value set" - report it as a warning like CODESYSTEM_UNSUPPORTED
+              warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM, cv.getCoding().getSystem(), cv.getCoding().getCode(), null);
             } else if (cv.getCoding().getVersion() == null) {
               ok = rule(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_INVALID_CONCEPT_CODE, cv.getCoding().getSystem(), cv.getCoding().getCode(), null) && ok;
             } else {

@@ -83,7 +83,7 @@ public class TerminologyClientContext {
   
   private Map<String, TerminologyClientContextUseCount> useCounts = new HashMap<>();
   private boolean isTxCaching;
-  private final Set<String> cached = new HashSet<>();
+  private final Set<String> cached = java.util.Collections.synchronizedSet(new HashSet<>()); // contains/add called from concurrent validator threads (incl. via getCached())
   private boolean master;
   private String cacheId;
 
@@ -116,7 +116,7 @@ public class TerminologyClientContext {
     }
   }
   
-  public void seeUse(String s, TerminologyClientContextUseType useType) {
+  public synchronized void seeUse(String s, TerminologyClientContextUseType useType) {
     TerminologyClientContextUseCount uc = useCounts.get(s);
     if (uc == null) {
       uc = new TerminologyClientContextUseCount();

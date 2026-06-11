@@ -62,7 +62,9 @@ POSSIBILITY OF SUCH DAMAGE.
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.BufferedWriter;
 import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
@@ -201,7 +203,9 @@ public abstract class JsonParserBase extends ParserBase implements IParser {
    */
   @Override
   public void compose(OutputStream stream, Resource resource) throws IOException {
-    OutputStreamWriter osw = new OutputStreamWriter(stream, "UTF-8");
+    // buffered: JsonCreatorDirect emits many tiny writes, and pushing each one through the
+    // charset encoder individually is very expensive (per-write CharBuffer/char[] allocation)
+    Writer osw = new BufferedWriter(new OutputStreamWriter(stream, "UTF-8"));
     if (style == OutputStyle.CANONICAL) {
       json = new JsonCreatorCanonical(osw);
     } else if (style == OutputStyle.PRETTY) {
@@ -255,7 +259,8 @@ public abstract class JsonParserBase extends ParserBase implements IParser {
   
   @Override
   public void compose(OutputStream stream, DataType type, String rootName) throws IOException {
-    OutputStreamWriter osw = new OutputStreamWriter(stream, "UTF-8");
+    // buffered: see compose(OutputStream, Resource) above
+    Writer osw = new BufferedWriter(new OutputStreamWriter(stream, "UTF-8"));
     if (style == OutputStyle.CANONICAL) {
       json = new JsonCreatorCanonical(osw);
     } else if (style == OutputStyle.PRETTY) {

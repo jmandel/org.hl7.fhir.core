@@ -152,34 +152,38 @@ public abstract class Base implements Serializable, IBase, IElement {
   private List<ValidationMessage> validationMessages; 
    
   
-  public Object getUserData(String name) {
+  // the userData accessors are synchronized because shared resources (CodeSystem/ValueSet/StructureDefinition
+  // instances handed out by a shared worker context) are lazily stamped with user data while concurrent
+  // validator threads read it; the lazy HashMap init + put would otherwise race. Single-threaded behavior
+  // is unchanged, and uncontended synchronization is cheap.
+  public synchronized Object getUserData(String name) {
     if (userData == null)
       return null;
     return userData.get(name);
   }
-  
-  public void setUserData(String name, Object value) {
+
+  public synchronized void setUserData(String name, Object value) {
     if (userData == null)
       userData = new HashMap<String, Object>();
     userData.put(name, value);
   }
 
-  public void clearUserData(String name) {
+  public synchronized void clearUserData(String name) {
     if (userData != null)
       userData.remove(name);
   }
- 
-  
-  public void setUserDataINN(String name, Object value) {
+
+
+  public synchronized void setUserDataINN(String name, Object value) {
     if (value == null)
       return;
-    
+
     if (userData == null)
       userData = new HashMap<String, Object>();
     userData.put(name, value);
   }
 
-  public boolean hasUserData(String name) {
+  public synchronized boolean hasUserData(String name) {
     if (userData == null)
       return false;
     else
@@ -201,14 +205,14 @@ public abstract class Base implements Serializable, IBase, IElement {
     return (Integer) getUserData(name);
   }
 
-  public void copyUserData(Base other) {
+  public synchronized void copyUserData(Base other) {
     if (other.userData != null) {
       if (userData == null) {
         userData = new HashMap<>();
       }
       userData.putAll(other.userData);
     }
-  }      
+  }
 
   public boolean hasFormatComment() {
     return hasFormatCommentPre() || hasFormatCommentPost();

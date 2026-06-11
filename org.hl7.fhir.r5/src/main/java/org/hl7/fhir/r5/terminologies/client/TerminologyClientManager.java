@@ -144,11 +144,15 @@ public class TerminologyClientManager {
   
   private ITerminologyClientFactory factory;
   private String cacheId;
-  private List<TerminologyClientContext> serverList = new ArrayList<>(); // clients by server address
+  // Thread-safety: all of the mutating entry points of this class (chooseServer, findValueSetOnServer,
+  // findCodeSystemOnServer, supportsSystem, setMasterClient, copy) are synchronized, because validator
+  // threads share one manager. serverList is copy-on-write so the unsynchronized read-only entry points
+  // (hasClient, getMaster, getMasterClient) stay safe without locking.
+  private List<TerminologyClientContext> serverList = new java.util.concurrent.CopyOnWriteArrayList<>(); // clients by server address
   private Map<String, TerminologyClientContext> serverMap = new HashMap<>(); // clients by server address
   private Map<String, Boolean> serverSupportMap = new HashMap<>(); // clients by server address
   private Map<String, ServerOptionList> resMap = new HashMap<>(); // client resolution list
-  private List<InternalLogEvent> internalLog = new ArrayList<>();
+  private List<InternalLogEvent> internalLog = Collections.synchronizedList(new ArrayList<>());
   protected Parameters expParameters;
 
   private TerminologyCache cache;
@@ -176,7 +180,7 @@ public class TerminologyClientManager {
     return cacheId; 
   }
   
-  public void copy(TerminologyClientManager other) {
+  public synchronized void copy(TerminologyClientManager other) {
     cacheId = other.cacheId;  
     serverList.addAll(other.serverList);
     serverMap.putAll(other.serverMap);
@@ -189,7 +193,7 @@ public class TerminologyClientManager {
   }
 
 
-  public TerminologyClientContext chooseServer(ValueSet vs, Set<String> systems, boolean expand) throws TerminologyServiceException {
+  public synchronized TerminologyClientContext chooseServer(ValueSet vs, Set<String> systems, boolean expand) throws TerminologyServiceException {
     if (serverList.isEmpty()) {
       return null;
     }
@@ -347,7 +351,7 @@ public class TerminologyClientManager {
     return serverList.get(0);
   }
 
-  public TerminologyClientContext chooseServer(String vs, boolean expand) throws TerminologyServiceException {
+  public synchronized TerminologyClientContext chooseServer(String vs, boolean expand) throws TerminologyServiceException {
     if (serverList.isEmpty()) {
       return null;
     }
@@ -545,7 +549,7 @@ public class TerminologyClientManager {
     }
   }
 
-  public TerminologyClientContext setMasterClient(ITerminologyClient client, boolean useEcosystem) throws IOException {
+  public synchronized TerminologyClientContext setMasterClient(ITerminologyClient client, boolean useEcosystem) throws IOException {
     this.useEcosystem = useEcosystem;
     TerminologyClientContext terminologyClientContext = new TerminologyClientContext(client, cache, cacheId,true);
     serverList.clear();
@@ -576,7 +580,7 @@ public class TerminologyClientManager {
     this.factory = factory;    
   }
 
-  public void setCache(TerminologyCache cache) {
+  public synchronized void setCache(TerminologyCache cache) {
     this.cache = cache;
     this.cacheFile = null;
 
@@ -650,7 +654,7 @@ public class TerminologyClientManager {
     this.usage = usage;
   }
 
-  public SourcedValueSet findValueSetOnServer(String canonical) {
+  public synchronized SourcedValueSet findValueSetOnServer(String canonical) {
     if (IGNORE_TX_REGISTRY || getMasterClient() == null) {
       return null;
     }
@@ -784,7 +788,7 @@ public class TerminologyClientManager {
       return null;
     }
   }
-  public SourcedCodeSystem findCodeSystemOnServer(String canonical) {
+  public synchronized SourcedCodeSystem findCodeSystemOnServer(String canonical) {
     if (IGNORE_TX_REGISTRY || getMasterClient() == null || !useEcosystem) {
       return null;
     }
@@ -865,7 +869,7 @@ public class TerminologyClientManager {
     }
   }
 
-  public boolean supportsSystem(String system) throws IOException {
+  public synchronized boolean supportsSystem(String system) throws IOException {
     for (TerminologyClientContext client : serverList) {
       if (client.supportsSystem(system)) {
         return true;

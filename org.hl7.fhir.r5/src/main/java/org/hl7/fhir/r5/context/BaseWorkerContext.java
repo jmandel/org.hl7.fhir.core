@@ -267,7 +267,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   // all maps are to the full URI
   private CanonicalResourceManager<CodeSystem> codeSystems = new CanonicalResourceManager<CodeSystem>(false, minimalMemory);
   private final HashMap<String, SystemSupportInformation> supportedCodeSystems = new HashMap<>();
-  private final Set<String> unsupportedCodeSystems = new HashSet<String>(); // know that the terminology server doesn't support them
+  private final Set<String> unsupportedCodeSystems = Collections.synchronizedSet(new HashSet<String>()); // know that the terminology server doesn't support them; written/read from concurrent validator threads
   private CanonicalResourceManager<ValueSet> valueSets = new CanonicalResourceManager<ValueSet>(false, minimalMemory);
   private CanonicalResourceManager<ConceptMap> maps = new CanonicalResourceManager<ConceptMap>(false, minimalMemory);
   protected CanonicalResourceManager<StructureMap> transforms = new CanonicalResourceManager<StructureMap>(false, minimalMemory);
@@ -298,7 +298,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   @Getter
   private boolean allowLoadingDuplicates;
 
-  private final Set<String> codeSystemsUsed = new HashSet<>();
+  private final Set<String> codeSystemsUsed = Collections.synchronizedSet(new HashSet<>()); // written from concurrent validator threads
   protected ToolingClientLogger txLog;
   protected boolean canRunWithoutTerminology;
   protected boolean noTerminologyServer;
@@ -825,7 +825,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
             try {
               TerminologyClientContext client = terminologyClientManager.chooseServer(null, Set.of(urlWithVersion), false);
               supportedCodeSystems.put(urlWithVersion, new SystemSupportInformation(client.supportsSystem(urlWithVersion), client.getAddress(), client.getTxTestVersion(), client.supportsSystem(urlWithVersion) ? null : "The server does not support this code system"));
-            } catch (Exception e) {
+            } catch (IOException | FHIRException e) {
+              // deliberately only catch the failure modes that genuinely mean "terminology server unreachable / broken"
+              // (IO failures, and FHIR/terminology-service exceptions from the tx layer). Anything else (e.g. a
+              // ConcurrentModificationException or NPE from a bug) must propagate rather than silently flipping the
+              // whole run into no-terminology-server mode and manufacturing hundreds of bogus validation errors.
               if (canRunWithoutTerminology) {
                 noTerminologyServer = true;
                 logger.logMessage("==============!! Running without terminology server !! ==============");
@@ -834,6 +838,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
                   logger.logMessage("Error = " + e.getMessage() + "");
                 }
                 logger.logMessage("=====================================================================");
+                logger.logDebugMessage(LogCategory.TX, ExceptionUtils.getStackTrace(e));
                 return new SystemSupportInformation(false);
               } else {
                 e.printStackTrace();

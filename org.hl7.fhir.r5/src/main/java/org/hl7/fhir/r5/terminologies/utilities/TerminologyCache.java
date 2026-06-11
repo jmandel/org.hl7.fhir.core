@@ -31,10 +31,13 @@ package org.hl7.fhir.r5.terminologies.utilities;
 
 
 
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -282,7 +285,10 @@ public class TerminologyCache {
   }
 
 
-  private Object lock;
+  // Note: this used to be a lock supplied by the constructor (shared with BaseWorkerContext), which made
+  // every fetchResource/fetchCodeSystem on the context queue behind terminology cache file writes. The cache
+  // never calls back out while holding the lock, so it is safe (and much faster) for it to have its own lock.
+  private final Object lock = new Object();
   private String folder;
   @Getter private int requestCount;
   @Getter private int hitCount;
@@ -303,7 +309,7 @@ public class TerminologyCache {
 
   protected TerminologyCache(Object lock, String folder, Long capabilityCacheExpirationMilliseconds) throws FileNotFoundException, IOException, FHIRException {
     super();
-   this.lock = lock;
+   // the lock parameter is deliberately ignored: the cache uses its own internal lock (see field declaration)
    this.capabilityCacheExpirationMilliseconds = capabilityCacheExpirationMilliseconds;
    capabilityStatementCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
    terminologyCapabilitiesCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
@@ -351,38 +357,44 @@ public class TerminologyCache {
   }
 
   public String getServerId(String address) throws IOException  {
-    if (serverMap.containsKey(address)) {
-      return serverMap.get(address);
+    synchronized (lock) {
+      if (serverMap.containsKey(address)) {
+        return serverMap.get(address);
+      }
+      String id = address.replace("http://", "").replace("https://", "").replace("/", ".");
+      int i = 1;
+      while (serverMap.containsValue(id)) {
+        i++;
+        id =  address.replace("https:", "").replace("https:", "").replace("/", ".")+i;
+      }
+      serverMap.put(address, id);
+      if (folder != null) {
+        IniFile ini = new IniFile(Utilities.path(folder, "servers.ini"));
+        ini.setStringProperty("servers", id, address, null);
+        ini.save();
+      }
+      return id;
     }
-    String id = address.replace("http://", "").replace("https://", "").replace("/", ".");
-    int i = 1;
-    while (serverMap.containsValue(id)) {
-      i++;
-      id =  address.replace("https:", "").replace("https:", "").replace("/", ".")+i;
-    }
-    serverMap.put(address, id);
-    if (folder != null) {
-      IniFile ini = new IniFile(Utilities.path(folder, "servers.ini"));
-      ini.setStringProperty("servers", id, address, null);
-      ini.save();
-    }
-    return id;
   }
-  
+
   public void unload() {
     // not useable after this is called
-    caches.clear();
-    vsCache.clear();
-    csCache.clear();
-  }
-  
-  public void clear() throws IOException {
-    if (folder != null) {
-      FileUtilities.clearDirectory(folder);
+    synchronized (lock) {
+      caches.clear();
+      vsCache.clear();
+      csCache.clear();
     }
-    caches.clear();
-    vsCache.clear();
-    csCache.clear();
+  }
+
+  public void clear() throws IOException {
+    synchronized (lock) {
+      if (folder != null) {
+        FileUtilities.clearDirectory(folder);
+      }
+      caches.clear();
+      vsCache.clear();
+      csCache.clear();
+    }
   }
   
   public boolean hasCapabilityStatement(String address) {
@@ -419,6 +431,72 @@ public class TerminologyCache {
   }
 
 
+  // ----- memoization of the invariant parts of cache key generation ---------------------------------------
+  // The expansion Parameters instance is passed unchanged on every validateCode call, and the ValueSet
+  // instances are shared and stable during validation, so the pretty-printed JSON fragments used in the cache
+  // key (which must remain byte-identical so that the persistent cache files stay compatible) can be computed
+  // once per instance and reused, instead of being re-serialized on every single validateCode call.
+
+  private static final class ExpParametersJson {
+    private final Parameters params;
+    private final int paramCount;
+    private final String json;
+    ExpParametersJson(Parameters params, String json) {
+      this.params = params;
+      this.paramCount = params.getParameter().size();
+      this.json = json;
+    }
+  }
+  private volatile ExpParametersJson expParametersJsonMemo;
+
+  private String composeExpParamsJson(JsonParser json, Parameters expParameters) throws IOException {
+    if (expParameters == null) {
+      return json.composeString(expParameters); // preserve original behavior for null
+    }
+    ExpParametersJson memo = expParametersJsonMemo;
+    if (memo != null && memo.params == expParameters && memo.paramCount == expParameters.getParameter().size()) {
+      return memo.json;
+    }
+    String s = json.composeString(expParameters);
+    expParametersJsonMemo = new ExpParametersJson(expParameters, s);
+    return s;
+  }
+
+  private static final class VsEssenceJson {
+    private final String json;
+    private final int composeIncludes;
+    private final int composeExcludes;
+    private final int expansionContains;
+    private final int expansionParams;
+    VsEssenceJson(ValueSet vs, String json) {
+      this.json = json;
+      this.composeIncludes = vs.getCompose().getInclude().size();
+      this.composeExcludes = vs.getCompose().getExclude().size();
+      this.expansionContains = vs.getExpansion().getContains().size();
+      this.expansionParams = vs.getExpansion().getParameter().size();
+    }
+    boolean matches(ValueSet vs) {
+      return composeIncludes == vs.getCompose().getInclude().size()
+          && composeExcludes == vs.getCompose().getExclude().size()
+          && expansionContains == vs.getExpansion().getContains().size()
+          && expansionParams == vs.getExpansion().getParameter().size();
+    }
+  }
+  // ValueSet does not override equals/hashCode, so this WeakHashMap is effectively identity-keyed,
+  // and entries disappear when the ValueSet is no longer referenced elsewhere
+  private final Map<ValueSet, VsEssenceJson> vsEssenceJsonMemo = Collections.synchronizedMap(new WeakHashMap<>());
+
+  /** byte-identical replacement for extracted(json, getVSEssense(vs)), memoized per ValueSet instance */
+  private String vsEssenceJson(JsonParser json, ValueSet vs) throws IOException {
+    VsEssenceJson memo = vsEssenceJsonMemo.get(vs);
+    if (memo != null && memo.matches(vs)) {
+      return memo.json;
+    }
+    String s = extracted(json, getVSEssense(vs));
+    vsEssenceJsonMemo.put(vs, new VsEssenceJson(vs, s));
+    return s;
+  }
+
   public CacheToken generateValidationToken(ValidationOptions options, Coding code, ValueSet vs, Parameters expParameters) {
     try {
       CacheToken ct = new CacheToken();
@@ -431,7 +509,7 @@ public class TerminologyCache {
       nameCacheToken(vs, ct);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = expParameters == null ? "" : json.composeString(expParameters);
+      String expJS = expParameters == null ? "" : composeExpParamsJson(json, expParameters);
 
       if (vs != null && vs.hasUrl() && vs.hasVersion()) {
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())
@@ -439,8 +517,7 @@ public class TerminologyCache {
       } else if (options.getVsAsUrl()) {
         ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+extracted(json, vs)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       } else {
-        ValueSet vsc = getVSEssense(vs);
-        ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vsc == null ? "null" : extracted(json, vsc))+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
+        ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vs == null ? "null" : vsEssenceJson(json, vs))+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
@@ -461,7 +538,7 @@ public class TerminologyCache {
       ct.setName(vsUrl);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
 
       ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vsUrl == null ? "null" : vsUrl)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       ct.key = String.valueOf(hashJson(ct.request));
@@ -493,15 +570,14 @@ public class TerminologyCache {
       nameCacheToken(vs, ct);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
       if (vs != null && vs.hasUrl() && vs.hasVersion()) {
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())+
-            "\", \"version\": \""+Utilities.escapeJson(vs.getVersion())+"\""+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}\r\n";      
-      } else if (vs == null) { 
-        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";        
+            "\", \"version\": \""+Utilities.escapeJson(vs.getVersion())+"\""+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}\r\n";
+      } else if (vs == null) {
+        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       } else {
-        ValueSet vsc = getVSEssense(vs);
-        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"valueSet\" :"+extracted(json, vsc)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
+        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"valueSet\" :"+vsEssenceJson(json, vs)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
@@ -528,11 +604,10 @@ public class TerminologyCache {
     if (vs.hasUrl() && vs.hasVersion()) {
       ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())+"\", \"version\": \""+Utilities.escapeJson(vs.getVersion())+"\"}\r\n";
     } else {
-      ValueSet vsc = getVSEssense(vs);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
       try {
-        ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"valueSet\" :"+extracted(json, vsc)+"}\r\n";
+        ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"valueSet\" :"+vsEssenceJson(json, vs)+"}\r\n";
       } catch (IOException e) {
         throw new Error(e);
       }
@@ -636,7 +711,14 @@ public class TerminologyCache {
         }
       }
       nc.list.add(e);
-      save(nc);  
+      if (n) {
+        // an existing entry was replaced, so the whole page must be rewritten
+        save(nc);
+      } else {
+        // a brand new entry: appending it produces a byte-identical file to a full rewrite,
+        // without re-serializing every existing entry on each store
+        appendToCacheFile(nc, e);
+      }
     }
   }
 
@@ -683,7 +765,7 @@ public class TerminologyCache {
       return;
 
     try {
-      OutputStreamWriter sw = new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, title + CACHE_FILE_EXTENSION)), "UTF-8");
+      Writer sw = new BufferedWriter(new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, title + CACHE_FILE_EXTENSION)), "UTF-8"));
 
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
@@ -700,11 +782,41 @@ public class TerminologyCache {
       return;
 
     try {
-      OutputStreamWriter sw = new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, nc.name+CACHE_FILE_EXTENSION)), "UTF-8");
+      Writer sw = new BufferedWriter(new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, nc.name+CACHE_FILE_EXTENSION)), "UTF-8"));
       sw.write(ENTRY_MARKER+"\r\n");
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
       for (CacheEntry ce : nc.list) {
+        writeEntry(sw, json, ce);
+      }
+      sw.close();
+    } catch (Exception e) {
+      log.error("error saving "+nc.name+": "+e.getMessage(), e);
+    }
+  }
+
+  private void appendToCacheFile(NamedCache nc, CacheEntry e) {
+    if (folder == null)
+      return;
+
+    try {
+      File f = ManagedFileAccess.file(Utilities.path(folder, nc.name+CACHE_FILE_EXTENSION));
+      if (!f.exists()) {
+        // first persistent entry for this page (or the file was removed): write the whole page
+        save(nc);
+        return;
+      }
+      Writer sw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(f, true), "UTF-8"));
+      JsonParser json = new JsonParser();
+      json.setOutputStyle(OutputStyle.PRETTY);
+      writeEntry(sw, json, e);
+      sw.close();
+    } catch (Exception ex) {
+      log.error("error saving "+nc.name+": "+ex.getMessage(), ex);
+    }
+  }
+
+  private void writeEntry(Writer sw, JsonParser json, CacheEntry ce) throws IOException {
         sw.write(ce.request.trim());
         sw.write(BREAK+"\r\n");
         if (ce.e != null) {
@@ -789,11 +901,6 @@ public class TerminologyCache {
           sw.write("\r\n}\r\n");
         }
         sw.write(ENTRY_MARKER+"\r\n");
-      }      
-      sw.close();
-    } catch (Exception e) {
-      log.error("error saving "+nc.name+": "+e.getMessage(), e);
-    }
   }
 
   private boolean isCapabilityCache(String fn) {
@@ -989,10 +1096,28 @@ public class TerminologyCache {
   }
 
   public String hashJson(String s) {
-    return String.valueOf(s
-      .trim()
-      .replaceAll("\\r\\n?", "\n")
-      .hashCode());
+    // streaming equivalent of: String.valueOf(s.trim().replaceAll("\\r\\n?", "\n").hashCode())
+    // (avoids allocating two large intermediate strings per call; result is identical)
+    int start = 0;
+    int end = s.length();
+    while (start < end && s.charAt(start) <= ' ') {
+      start++;
+    }
+    while (end > start && s.charAt(end - 1) <= ' ') {
+      end--;
+    }
+    int h = 0;
+    for (int i = start; i < end; i++) {
+      char c = s.charAt(i);
+      if (c == '\r') {
+        if (i + 1 < end && s.charAt(i + 1) == '\n') {
+          i++;
+        }
+        c = '\n';
+      }
+      h = 31 * h + c;
+    }
+    return String.valueOf(h);
   }
 
   // management
@@ -1052,8 +1177,19 @@ public class TerminologyCache {
       String name = getSystemNameKeyGenerator().getNameForSystem(url);
       if (caches.containsKey(name)) {
         caches.remove(name);
+        // also remove the persistent page, so that append-mode stores can't resurrect the removed entries
+        if (folder != null) {
+          try {
+            File f = ManagedFileAccess.file(Utilities.path(folder, name+CACHE_FILE_EXTENSION));
+            if (f.exists()) {
+              f.delete();
+            }
+          } catch (IOException e) {
+            // ignore - worst case the stale page stays, which was the old behavior anyway
+          }
+        }
       }
-    }   
+    }
   }
 
   public String getFolder() {
@@ -1081,15 +1217,22 @@ public class TerminologyCache {
   }
 
   public boolean hasValueSet(String canonical) {
-    return vsCache.containsKey(canonical);
+    synchronized (lock) {
+      return vsCache.containsKey(canonical);
+    }
   }
 
   public boolean hasCodeSystem(String canonical) {
-    return csCache.containsKey(canonical);
+    synchronized (lock) {
+      return csCache.containsKey(canonical);
+    }
   }
 
   public SourcedValueSet getValueSet(String canonical) {
-    SourcedValueSetEntry sp = vsCache.get(canonical);
+    SourcedValueSetEntry sp;
+    synchronized (lock) {
+      sp = vsCache.get(canonical);
+    }
     if (sp == null || folder == null) {
       return null;
     } else {
@@ -1102,7 +1245,10 @@ public class TerminologyCache {
   }
 
   public SourcedCodeSystem getCodeSystem(String canonical) {
-    SourcedCodeSystemEntry sp = csCache.get(canonical);
+    SourcedCodeSystemEntry sp;
+    synchronized (lock) {
+      sp = csCache.get(canonical);
+    }
     if (sp == null || folder == null) {
       return null;
     } else {
@@ -1118,6 +1264,7 @@ public class TerminologyCache {
     if (canonical == null) {
       return;
     }
+    synchronized (lock) {
     try {
       if (svs == null) {
         vsCache.put(canonical, null);
@@ -1149,12 +1296,14 @@ public class TerminologyCache {
     } catch (Exception e) {
       e.printStackTrace();
     }
+    }
   }
 
   public void cacheCodeSystem(String canonical, SourcedCodeSystem scs) {
     if (canonical == null) {
       return;
     }
+    synchronized (lock) {
     try {
       if (scs == null) {
         csCache.put(canonical, null);
@@ -1186,6 +1335,7 @@ public class TerminologyCache {
     } catch (Exception e) {
       e.printStackTrace();
     }
+    }
   }
 
   public CacheToken generateSubsumesToken(ValidationOptions options, Coding parent, Coding child, Parameters expParameters) {
@@ -1200,7 +1350,7 @@ public class TerminologyCache {
       ct.hasVersion = parent.hasVersion() || child.hasVersion();
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
       ct.request = "{\"op\": \"subsumes\", \"parent\" : "+json.composeString(parent, "code")+", \"child\" :"+json.composeString(child, "code")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
@@ -1243,11 +1393,13 @@ public class TerminologyCache {
 
 
   public String getReport() {
-    int c = 0;
-    for (NamedCache nc : caches.values()) {
-      c += nc.list.size();
+    synchronized (lock) {
+      int c = 0;
+      for (NamedCache nc : caches.values()) {
+        c += nc.list.size();
+      }
+      return "txCache report: "+
+        c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount;
     }
-    return "txCache report: "+
-      c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount;
   }
 }
