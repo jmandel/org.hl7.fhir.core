@@ -208,9 +208,15 @@ public class ConceptMapValidator extends BaseValidator {
               warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM, cv.getCoding().getSystem(), cv.getCoding().getCode(), null);
             } else if (cv.getResult().getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED_VERSION) {
               warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM_VERSION, cv.getCoding().getSystem(), cv.getCoding().getCode(), null, cv.getResult().getVersion());
-            } else if (cv.getResult().getErrorClass() == TerminologyServiceErrorClass.NOSERVICE || cv.getResult().getErrorClass() == TerminologyServiceErrorClass.SERVER_ERROR) {
-              // a terminology infrastructure failure (no server / server error) must never masquerade as
-              // "code X is not valid in the value set" - report it as a warning like CODESYSTEM_UNSUPPORTED
+            } else if (cv.getResult().getErrorClass() == TerminologyServiceErrorClass.NOSERVICE) {
+              // NOSERVICE means the terminology infrastructure was not available for this check - either the
+              // run was started without a server, or the context flipped into no-terminology-server mode
+              // mid-run. The validation result carries no signal to distinguish the two, so the downgrade is
+              // deliberately limited to NOSERVICE alone (SERVER_ERROR and all other failure classes keep the
+              // original error behavior): "no service" must never masquerade as "code X is not valid in the
+              // value set". Residual behavior delta: a deliberate no-server run now reports these concept-map
+              // code checks as warnings rather than errors, which matches how other terminology checks degrade
+              // when no server is available.
               warning(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_CONCEPT_CODE_UNKNOWN_SYSTEM, cv.getCoding().getSystem(), cv.getCoding().getCode(), null);
             } else if (cv.getCoding().getVersion() == null) {
               ok = rule(errors, "2023-09-06", IssueType.BUSINESSRULE, cv.getStack(), cv.getResult().isOk(), I18nConstants.CONCEPTMAP_VS_INVALID_CONCEPT_CODE, cv.getCoding().getSystem(), cv.getCoding().getCode(), null) && ok;

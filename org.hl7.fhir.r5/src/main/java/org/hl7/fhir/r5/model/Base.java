@@ -205,12 +205,21 @@ public abstract class Base implements Serializable, IBase, IElement {
     return (Integer) getUserData(name);
   }
 
-  public synchronized void copyUserData(Base other) {
-    if (other.userData != null) {
-      if (userData == null) {
-        userData = new HashMap<>();
+  public void copyUserData(Base other) {
+    // snapshot other's userData under other's monitor before iterating, since setUserData (synchronized)
+    // may be mutating it concurrently. Lock ordering: only one monitor is ever held at a time - take the
+    // snapshot under other's monitor, release it, then write into this under this's monitor.
+    Map<String, Object> snapshot;
+    synchronized (other) {
+      snapshot = other.userData == null ? null : new HashMap<>(other.userData);
+    }
+    if (snapshot != null) {
+      synchronized (this) {
+        if (userData == null) {
+          userData = new HashMap<>();
+        }
+        userData.putAll(snapshot);
       }
-      userData.putAll(other.userData);
     }
   }
 
@@ -557,10 +566,20 @@ public abstract class Base implements Serializable, IBase, IElement {
 
   public abstract Base copy();
   
-  public void copyValues(Base dst) {  
-    if (isCopyUserData() && userData != null) {
-      dst.userData = new HashMap<>();
-      dst.userData.putAll(userData);
+  public void copyValues(Base dst) {
+    if (isCopyUserData()) {
+      // snapshot this.userData under this's monitor before iterating, since setUserData (synchronized)
+      // may be mutating it concurrently. Lock ordering: never hold both monitors at once - snapshot under
+      // this's monitor, release, then assign into dst under dst's monitor.
+      Map<String, Object> snapshot;
+      synchronized (this) {
+        snapshot = userData == null ? null : new HashMap<>(userData);
+      }
+      if (snapshot != null) {
+        synchronized (dst) {
+          dst.userData = snapshot;
+        }
+      }
     }
   }
 

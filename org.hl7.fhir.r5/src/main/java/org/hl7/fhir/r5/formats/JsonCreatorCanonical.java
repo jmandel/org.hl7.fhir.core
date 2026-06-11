@@ -126,6 +126,11 @@ public class JsonCreatorCanonical implements JsonCreator {
     name = null;
   }
 
+  /** binary-compatibility overload: the constructor historically took an OutputStreamWriter */
+  public JsonCreatorCanonical(java.io.OutputStreamWriter osw) {
+    this((java.io.Writer) osw);
+  }
+
   private String takeName() {
     String res = name;
     name = null;

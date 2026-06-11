@@ -307,9 +307,17 @@ public class TerminologyCache {
   @Getter @Setter private static boolean noCaching;
   @Getter @Setter private static boolean cacheErrors;
 
+  /**
+   * @param lock unused as of the thread-safety rework: the cache is now self-synchronized on a private
+   *        internal lock (see the {@code lock} field). The parameter is retained for source/binary
+   *        compatibility only. It is deliberately NOT honored: the in-tree callers pass the
+   *        BaseWorkerContext itself (or its internal lock object), and using that as the cache lock would
+   *        re-couple every context fetchResource/fetchCodeSystem call to terminology cache file I/O, and
+   *        would make the cache lock non-leaf in the lock-ordering graph (context lock -> cache I/O),
+   *        reintroducing both the contention and the deadlock surface this change removed.
+   */
   protected TerminologyCache(Object lock, String folder, Long capabilityCacheExpirationMilliseconds) throws FileNotFoundException, IOException, FHIRException {
     super();
-   // the lock parameter is deliberately ignored: the cache uses its own internal lock (see field declaration)
    this.capabilityCacheExpirationMilliseconds = capabilityCacheExpirationMilliseconds;
    capabilityStatementCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
    terminologyCapabilitiesCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
@@ -337,7 +345,11 @@ public class TerminologyCache {
     }
   }
 
-  // use lock from the context
+  /**
+   * @param lock unused - the cache is self-synchronized on a private internal lock as of the thread-safety
+   *        rework; the parameter is retained for compatibility only (see the three-arg constructor for the
+   *        lock-ordering rationale)
+   */
   public TerminologyCache(Object lock, String folder) throws IOException, FHIRException {
     this(lock, folder, CAPABILITY_CACHE_EXPIRATION_MILLISECONDS);
   }
@@ -440,21 +452,46 @@ public class TerminologyCache {
   private static final class ExpParametersJson {
     private final Parameters params;
     private final int paramCount;
+    private final int partCount;
     private final String json;
     ExpParametersJson(Parameters params, String json) {
       this.params = params;
       this.paramCount = params.getParameter().size();
+      this.partCount = countParts(params);
       this.json = json;
+    }
+    boolean matches(Parameters expParameters) {
+      // identity plus cheap structural checks (top-level parameter count and total nested part count),
+      // so that an in-place mutation of the same instance that adds/removes parameters or parts is detected
+      return params == expParameters
+          && paramCount == expParameters.getParameter().size()
+          && partCount == countParts(expParameters);
+    }
+    private static int countParts(Parameters params) {
+      int n = 0;
+      for (Parameters.ParametersParameterComponent p : params.getParameter()) {
+        n += p.getPart().size();
+      }
+      return n;
     }
   }
   private volatile ExpParametersJson expParametersJsonMemo;
+
+  /**
+   * Invalidates the memoized serialization of the expansion parameters. Called by BaseWorkerContext
+   * whenever its expansion parameters object is set or replaced, so a mutated-then-reused Parameters
+   * instance can never be paired with a stale serialization.
+   */
+  public void clearExpParametersMemo() {
+    expParametersJsonMemo = null;
+  }
 
   private String composeExpParamsJson(JsonParser json, Parameters expParameters) throws IOException {
     if (expParameters == null) {
       return json.composeString(expParameters); // preserve original behavior for null
     }
     ExpParametersJson memo = expParametersJsonMemo;
-    if (memo != null && memo.params == expParameters && memo.paramCount == expParameters.getParameter().size()) {
+    if (memo != null && memo.matches(expParameters)) {
       return memo.json;
     }
     String s = json.composeString(expParameters);
@@ -468,18 +505,43 @@ public class TerminologyCache {
     private final int composeExcludes;
     private final int expansionContains;
     private final int expansionParams;
+    private final int firstIncludeConcepts; // extracted() branches on this being > 1000
+    private final int includeVersionsHash;  // detects in-place changes to include version pinning
     VsEssenceJson(ValueSet vs, String json) {
       this.json = json;
       this.composeIncludes = vs.getCompose().getInclude().size();
       this.composeExcludes = vs.getCompose().getExclude().size();
       this.expansionContains = vs.getExpansion().getContains().size();
       this.expansionParams = vs.getExpansion().getParameter().size();
+      this.firstIncludeConcepts = firstIncludeConceptCount(vs);
+      this.includeVersionsHash = includeVersionsHash(vs);
     }
+    // Guards against in-place structural mutation of a memoized ValueSet: list sizes at every level the
+    // cache key serialization depends on, the first include's concept count (because extracted() switches
+    // to url-only form when it exceeds 1000), and a deterministic hash of the include version fields.
+    // Residual assumption (documented, not checked): a shared ValueSet is not otherwise mutated in place
+    // (e.g. editing a concept code without changing any list size or include version) while validation is
+    // running. Worker contexts treat handed-out ValueSets as immutable during validation, so this holds in
+    // practice; a violation would also have corrupted the pre-memoization cache keys mid-run.
     boolean matches(ValueSet vs) {
       return composeIncludes == vs.getCompose().getInclude().size()
           && composeExcludes == vs.getCompose().getExclude().size()
           && expansionContains == vs.getExpansion().getContains().size()
-          && expansionParams == vs.getExpansion().getParameter().size();
+          && expansionParams == vs.getExpansion().getParameter().size()
+          && firstIncludeConcepts == firstIncludeConceptCount(vs)
+          && includeVersionsHash == includeVersionsHash(vs);
+    }
+    private static int firstIncludeConceptCount(ValueSet vs) {
+      // deliberately not getIncludeFirstRep(): that would *add* an include to an empty compose
+      List<ConceptSetComponent> includes = vs.getCompose().getInclude();
+      return includes.isEmpty() ? 0 : includes.get(0).getConcept().size();
+    }
+    private static int includeVersionsHash(ValueSet vs) {
+      int h = 1;
+      for (ConceptSetComponent inc : vs.getCompose().getInclude()) {
+        h = 31 * h + (inc.hasVersion() ? inc.getVersion().hashCode() : 0);
+      }
+      return h;
     }
   }
   // ValueSet does not override equals/hashCode, so this WeakHashMap is effectively identity-keyed,
