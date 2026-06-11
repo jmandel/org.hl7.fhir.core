@@ -152,34 +152,38 @@ public abstract class Base implements Serializable, IBase, IElement {
   private List<ValidationMessage> validationMessages; 
    
   
-  public Object getUserData(String name) {
+  // the userData accessors are synchronized because shared resources (CodeSystem/ValueSet/StructureDefinition
+  // instances handed out by a shared worker context) are lazily stamped with user data while concurrent
+  // validator threads read it; the lazy HashMap init + put would otherwise race. Single-threaded behavior
+  // is unchanged, and uncontended synchronization is cheap.
+  public synchronized Object getUserData(String name) {
     if (userData == null)
       return null;
     return userData.get(name);
   }
-  
-  public void setUserData(String name, Object value) {
+
+  public synchronized void setUserData(String name, Object value) {
     if (userData == null)
       userData = new HashMap<String, Object>();
     userData.put(name, value);
   }
 
-  public void clearUserData(String name) {
+  public synchronized void clearUserData(String name) {
     if (userData != null)
       userData.remove(name);
   }
- 
-  
-  public void setUserDataINN(String name, Object value) {
+
+
+  public synchronized void setUserDataINN(String name, Object value) {
     if (value == null)
       return;
-    
+
     if (userData == null)
       userData = new HashMap<String, Object>();
     userData.put(name, value);
   }
 
-  public boolean hasUserData(String name) {
+  public synchronized boolean hasUserData(String name) {
     if (userData == null)
       return false;
     else
@@ -202,13 +206,22 @@ public abstract class Base implements Serializable, IBase, IElement {
   }
 
   public void copyUserData(Base other) {
-    if (other.userData != null) {
-      if (userData == null) {
-        userData = new HashMap<>();
-      }
-      userData.putAll(other.userData);
+    // snapshot other's userData under other's monitor before iterating, since setUserData (synchronized)
+    // may be mutating it concurrently. Lock ordering: only one monitor is ever held at a time - take the
+    // snapshot under other's monitor, release it, then write into this under this's monitor.
+    Map<String, Object> snapshot;
+    synchronized (other) {
+      snapshot = other.userData == null ? null : new HashMap<>(other.userData);
     }
-  }      
+    if (snapshot != null) {
+      synchronized (this) {
+        if (userData == null) {
+          userData = new HashMap<>();
+        }
+        userData.putAll(snapshot);
+      }
+    }
+  }
 
   public boolean hasFormatComment() {
     return hasFormatCommentPre() || hasFormatCommentPost();
@@ -555,10 +568,20 @@ public abstract class Base implements Serializable, IBase, IElement {
 
   public abstract Base copy();
   
-  public void copyValues(Base dst) {  
-    if (isCopyUserData() && userData != null) {
-      dst.userData = new HashMap<>();
-      dst.userData.putAll(userData);
+  public void copyValues(Base dst) {
+    if (isCopyUserData()) {
+      // snapshot this.userData under this's monitor before iterating, since setUserData (synchronized)
+      // may be mutating it concurrently. Lock ordering: never hold both monitors at once - snapshot under
+      // this's monitor, release, then assign into dst under dst's monitor.
+      Map<String, Object> snapshot;
+      synchronized (this) {
+        snapshot = userData == null ? null : new HashMap<>(userData);
+      }
+      if (snapshot != null) {
+        synchronized (dst) {
+          dst.userData = snapshot;
+        }
+      }
     }
   }
 

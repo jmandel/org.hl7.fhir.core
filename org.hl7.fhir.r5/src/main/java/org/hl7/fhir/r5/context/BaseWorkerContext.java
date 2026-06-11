@@ -268,7 +268,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   // all maps are to the full URI
   private CanonicalResourceManager<CodeSystem> codeSystems = new CanonicalResourceManager<CodeSystem>(false, minimalMemory);
   private final HashMap<String, SystemSupportInformation> supportedCodeSystems = new HashMap<>();
-  private final Set<String> unsupportedCodeSystems = new HashSet<String>(); // know that the terminology server doesn't support them
+  private final Set<String> unsupportedCodeSystems = Collections.synchronizedSet(new HashSet<String>()); // know that the terminology server doesn't support them; written/read from concurrent validator threads
   private CanonicalResourceManager<ValueSet> valueSets = new CanonicalResourceManager<ValueSet>(false, minimalMemory);
   private CanonicalResourceManager<ConceptMap> maps = new CanonicalResourceManager<ConceptMap>(false, minimalMemory);
   protected CanonicalResourceManager<StructureMap> transforms = new CanonicalResourceManager<StructureMap>(false, minimalMemory);
@@ -299,7 +299,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   @Getter
   private boolean allowLoadingDuplicates;
 
-  private final Set<String> codeSystemsUsed = new HashSet<>();
+  private final Set<String> codeSystemsUsed = Collections.synchronizedSet(new HashSet<>()); // written from concurrent validator threads
   protected ToolingClientLogger txLog;
   protected boolean canRunWithoutTerminology;
   protected boolean noTerminologyServer;
@@ -783,7 +783,13 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   public CodeSystem fetchSupplementedCodeSystem(String system, VersionResolutionRules rules) {
     CodeSystem cs = fetchCodeSystem(system, rules);
     if (cs != null) {
-      List<CodeSystem> supplements = codeSystems.getSupplements(cs);
+      // CanonicalResourceManager is not internally synchronized; all reads of it must hold the same
+      // lock that cacheResource/dropResource hold while mutating it (getSupplements returns a fresh
+      // list, so only the call itself needs to be guarded)
+      List<CodeSystem> supplements;
+      synchronized (lock) {
+        supplements = codeSystems.getSupplements(cs);
+      }
       if (supplements.size() > 0) {
         cs = CodeSystemUtilities.mergeSupplements(cs, supplements);
       }
@@ -795,7 +801,10 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   public CodeSystem fetchSupplementedCodeSystem(String system, VersionResolutionRules rules, String version, List<String> specifiedSupplements, Resource sourceOfReference) {
     CodeSystem cs = fetchCodeSystem(system, rules, version, sourceOfReference);
     if (cs != null) {
-      List<CodeSystem> supplements = codeSystems.getSupplements(cs);
+      List<CodeSystem> supplements;
+      synchronized (lock) { // see fetchSupplementedCodeSystem above: CRM reads must hold the context lock
+        supplements = codeSystems.getSupplements(cs);
+      }
       List<CodeSystem> activeSupplements = new ArrayList<>();
       for (CodeSystem c : supplements) {
         if (CodeSystemUtilities.isLangPack(c)) {
@@ -836,7 +845,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
             try {
               TerminologyClientContext client = terminologyClientManager.chooseServer(null, Set.of(urlWithVersion), false);
               supportedCodeSystems.put(urlWithVersion, new SystemSupportInformation(client.supportsSystem(urlWithVersion), client.getAddress(), client.getTxTestVersion(), client.supportsSystem(urlWithVersion) ? null : "The server does not support this code system"));
-            } catch (Exception e) {
+            } catch (IOException | FHIRException e) {
+              // deliberately only catch the failure modes that genuinely mean "terminology server unreachable / broken"
+              // (IO failures, and FHIR/terminology-service exceptions from the tx layer). Anything else (e.g. a
+              // ConcurrentModificationException or NPE from a bug) must propagate rather than silently flipping the
+              // whole run into no-terminology-server mode and manufacturing hundreds of bogus validation errors.
               if (canRunWithoutTerminology) {
                 noTerminologyServer = true;
                 logger.logMessage("==============!! Running without terminology server !! ==============");
@@ -845,6 +858,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
                   logger.logMessage("Error = " + e.getMessage() + "");
                 }
                 logger.logMessage("=====================================================================");
+                logger.logDebugMessage(LogCategory.TX, ExceptionUtils.getStackTrace(e));
                 return new SystemSupportInformation(false);
               } else {
                 e.printStackTrace();
@@ -2022,7 +2036,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (cs != null && !hasCanonicalResource(pin, "tx-resource", cs.getVUrl()) && (cs.getContent() == CodeSystemContentMode.COMPLETE || cs.getContent() == CodeSystemContentMode.FRAGMENT)) {
       cache = checkAddToParams(tc, pin, cs) || cache;
     }
-    for (CodeSystem supp : codeSystems.getSupplements(cs)) {
+    for (CodeSystem supp : getSupplementsLocked(cs)) {
       if (opCtxt != null) {
         opCtxt.seeSupplement(supp);
       }
@@ -2032,7 +2046,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
     if (sys != null) {
       // we also have to look at this by version because the resource might not be versioned or we might not have a copy
-      for (CodeSystem supp : codeSystems.getSupplements(sys)) {
+      for (CodeSystem supp : getSupplementsLocked(sys)) {
 
         if (opCtxt != null) {
           opCtxt.seeSupplement(supp);
@@ -2044,7 +2058,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       if (!sys.contains("!")) {
         sys = getFixedVersion(sys, pin);
         if (sys != null) {
-          for (CodeSystem supp : codeSystems.getSupplements(sys)) {
+          for (CodeSystem supp : getSupplementsLocked(sys)) {
             if (opCtxt != null) {
               opCtxt.seeSupplement(supp);
             }
@@ -2056,6 +2070,21 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       }
     }
     return cache;
+  }
+
+  // CanonicalResourceManager is not internally synchronized, and these lookups are reachable from
+  // concurrent validator threads (via validateCodeBatch / expandVS) while cacheResource may be
+  // mutating the manager under 'lock'. getSupplements returns a fresh list, so guarding the call is enough.
+  private List<CodeSystem> getSupplementsLocked(CodeSystem cs) {
+    synchronized (lock) {
+      return codeSystems.getSupplements(cs);
+    }
+  }
+
+  private List<CodeSystem> getSupplementsLocked(String sys) {
+    synchronized (lock) {
+      return codeSystems.getSupplements(sys);
+    }
   }
 
   private String getFixedVersion(String sys, Parameters pin) {
@@ -3180,6 +3209,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return null;
     }
 
+    // hold the context lock for the CanonicalResourceManager reads, like fetchResource does:
+    // the managers are not internally synchronized and may be mutated concurrently by cacheResource
+    synchronized (lock) {
     if (codeSystems.has(url)) {
       return codeSystems.get(url).getWebPath();
     }
@@ -3239,6 +3271,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (plans.has(url)) {
       return plans.get(url).getWebPath();
     }
+    } // synchronized (lock)
 
     if (url.equals("http://loinc.org")) {
       return corePath + "loinc.html";

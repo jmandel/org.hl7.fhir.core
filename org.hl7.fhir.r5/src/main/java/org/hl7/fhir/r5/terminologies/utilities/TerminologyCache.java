@@ -84,17 +84,15 @@ import com.google.gson.JsonPrimitive;
 @Slf4j
 public class TerminologyCache {
 
-  // TODO (thread-safety): locking in this class is inconsistent. The validation / expansion /
-  // subsumption read+write paths (getValidation, cacheValidation, getExpansion, cacheExpansion,
-  // getSubsumes, cacheSubsumes, store, save) all synchronize on `lock`, but several other paths
-  // that mutate or iterate shared state take no lock:
-  //   - getServerId() mutates serverMap (and writes servers.ini)
-  //   - cacheValueSet() / cacheCodeSystem() mutate vsCache / csCache and iterate them to rewrite
-  //     the vs-externals.json / cs-externals.json files
-  //   - getReport() iterates caches and the per-NamedCache entry sets
-  // If this cache is ever touched from more than one thread, those are data races / potential
-  // ConcurrentModificationExceptions. The intended threading model needs to be decided, and then
-  // either `lock` extended to cover these paths or it documented that they are single-threaded.
+  // Thread-safety: every path that reads or mutates shared state synchronizes on `lock` - both the
+  // validation / expansion / subsumption read+write paths (getValidation, cacheValidation, getExpansion,
+  // cacheExpansion, getSubsumes, cacheSubsumes, store, save) and the paths that were previously
+  // unsynchronized (getServerId, cacheValueSet/cacheCodeSystem, hasValueSet/hasCodeSystem,
+  // getValueSet/getCodeSystem, unload, clear, getReport). This cache is shared by all the threads of a
+  // parallel validation run; the previously-unsynchronized paths were observed throwing
+  // ConcurrentModificationException (iterating csCache.keySet() in cacheCodeSystem while another thread
+  // put into it) under a 12-thread validation load. The cache never calls back out to the worker context
+  // while holding the lock, so the lock is a leaf in the lock-ordering graph.
 
   public static class SourcedCodeSystem {
     private String server;
@@ -330,7 +328,12 @@ public class TerminologyCache {
   }
 
 
-  private final Object lock;
+  // Note: this used to be a lock supplied by the constructor (shared with BaseWorkerContext), which made
+  // every fetchResource/fetchCodeSystem on the context queue behind terminology cache file writes, and made
+  // the cache lock non-leaf in the lock-ordering graph (context lock -> client manager monitor -> cache).
+  // The cache never calls back out while holding the lock, so it is safe (and much faster) for it to have
+  // its own private leaf lock.
+  private final Object lock = new Object();
   private final String folder;
   @Getter private int requestCount;
   @Getter private int hitCount;
@@ -351,9 +354,17 @@ public class TerminologyCache {
   @Getter @Setter private static boolean noCaching;
   @Getter @Setter private static boolean cacheErrors;
 
+  /**
+   * @param lock unused as of the thread-safety rework: the cache is now self-synchronized on a private
+   *        internal lock (see the {@code lock} field). The parameter is retained for source/binary
+   *        compatibility only. It is deliberately NOT honored: the in-tree callers pass the
+   *        BaseWorkerContext's own lock object, and using that as the cache lock would re-couple every
+   *        context fetchResource/fetchCodeSystem call to terminology cache file I/O, and would make the
+   *        cache lock non-leaf in the lock-ordering graph (context lock -> client manager monitor ->
+   *        cache lock), introducing both contention and a deadlock surface.
+   */
   protected TerminologyCache(Object lock, String folder, Long capabilityCacheExpirationMilliseconds) throws FileNotFoundException, IOException, FHIRException {
     super();
-   this.lock = lock;
    this.capabilityCacheExpirationMilliseconds = capabilityCacheExpirationMilliseconds;
    capabilityStatementCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
    terminologyCapabilitiesCache = new CommonsTerminologyCapabilitiesCache<>(capabilityCacheExpirationMilliseconds, TimeUnit.MILLISECONDS);
@@ -381,7 +392,11 @@ public class TerminologyCache {
     }
   }
 
-  // use lock from the context
+  /**
+   * @param lock unused - the cache is self-synchronized on a private internal lock as of the thread-safety
+   *        rework; the parameter is retained for compatibility only (see the three-arg constructor for the
+   *        lock-ordering rationale)
+   */
   public TerminologyCache(Object lock, String folder) throws IOException, FHIRException {
     this(lock, folder, CAPABILITY_CACHE_EXPIRATION_MILLISECONDS);
   }
@@ -401,23 +416,25 @@ public class TerminologyCache {
   }
 
   public String getServerId(String address) throws IOException  {
-    if (serverMap.containsKey(address)) {
-      return serverMap.get(address);
+    synchronized (lock) {
+      if (serverMap.containsKey(address)) {
+        return serverMap.get(address);
+      }
+      String base = serverIdBase(address);
+      String id = base;
+      int i = 1;
+      while (serverMap.containsValue(id)) {
+        i++;
+        id = base + i;
+      }
+      serverMap.put(address, id);
+      if (folder != null) {
+        IniFile ini = new IniFile(Utilities.path(folder, "servers.ini"));
+        ini.setStringProperty("servers", id, address, null);
+        ini.save();
+      }
+      return id;
     }
-    String base = serverIdBase(address);
-    String id = base;
-    int i = 1;
-    while (serverMap.containsValue(id)) {
-      i++;
-      id = base + i;
-    }
-    serverMap.put(address, id);
-    if (folder != null) {
-      IniFile ini = new IniFile(Utilities.path(folder, "servers.ini"));
-      ini.setStringProperty("servers", id, address, null);
-      ini.save();
-    }
-    return id;
   }
 
   /**
@@ -439,19 +456,23 @@ public class TerminologyCache {
     // not useable after this is called — flush any pending writes first so we don't lose
     // entries that were waiting out the SAVE_DELAY_MS coalescing window.
     save();
-    caches.clear();
-    vsCache.clear();
-    csCache.clear();
-    unloaded = true;
+    synchronized (lock) {
+      caches.clear();
+      vsCache.clear();
+      csCache.clear();
+      unloaded = true;
+    }
   }
 
   public void clear() throws IOException {
-    if (folder != null) {
-      FileUtilities.clearDirectory(folder);
+    synchronized (lock) {
+      if (folder != null) {
+        FileUtilities.clearDirectory(folder);
+      }
+      caches.clear();
+      vsCache.clear();
+      csCache.clear();
     }
-    caches.clear();
-    vsCache.clear();
-    csCache.clear();
   }
   
   public boolean hasCapabilityStatement(String address) {
@@ -1268,15 +1289,22 @@ public class TerminologyCache {
   }
 
   public boolean hasValueSet(String canonical) {
-    return vsCache.containsKey(canonical);
+    synchronized (lock) {
+      return vsCache.containsKey(canonical);
+    }
   }
 
   public boolean hasCodeSystem(String canonical) {
-    return csCache.containsKey(canonical);
+    synchronized (lock) {
+      return csCache.containsKey(canonical);
+    }
   }
 
   public SourcedValueSet getValueSet(String canonical) {
-    SourcedValueSetEntry sp = vsCache.get(canonical);
+    SourcedValueSetEntry sp;
+    synchronized (lock) {
+      sp = vsCache.get(canonical);
+    }
     if (sp == null || folder == null) {
       return null;
     } else {
@@ -1289,7 +1317,10 @@ public class TerminologyCache {
   }
 
   public SourcedCodeSystem getCodeSystem(String canonical) {
-    SourcedCodeSystemEntry sp = csCache.get(canonical);
+    SourcedCodeSystemEntry sp;
+    synchronized (lock) {
+      sp = csCache.get(canonical);
+    }
     if (sp == null || folder == null) {
       return null;
     } else {
@@ -1305,6 +1336,7 @@ public class TerminologyCache {
     if (canonical == null) {
       return;
     }
+    synchronized (lock) {
     try {
       if (svs == null) {
         vsCache.put(canonical, null);
@@ -1336,12 +1368,14 @@ public class TerminologyCache {
     } catch (Exception e) {
       e.printStackTrace();
     }
+    }
   }
 
   public void cacheCodeSystem(String canonical, SourcedCodeSystem scs) {
     if (canonical == null) {
       return;
     }
+    synchronized (lock) {
     try {
       if (scs == null) {
         csCache.put(canonical, null);
@@ -1372,6 +1406,7 @@ public class TerminologyCache {
       }
     } catch (Exception e) {
       e.printStackTrace();
+    }
     }
   }
 
@@ -1430,11 +1465,13 @@ public class TerminologyCache {
 
 
   public String getReport() {
-    int c = 0;
-    for (NamedCache nc : caches.values()) {
-      c += nc.list.size();
+    synchronized (lock) {
+      int c = 0;
+      for (NamedCache nc : caches.values()) {
+        c += nc.list.size();
+      }
+      return "txCache report: "+
+        c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount;
     }
-    return "txCache report: "+
-      c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount;
   }
 }
