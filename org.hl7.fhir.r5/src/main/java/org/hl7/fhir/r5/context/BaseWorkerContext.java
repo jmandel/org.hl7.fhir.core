@@ -1224,7 +1224,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     // 2nd pass: What can we do internally 
     // 3rd pass: hit the server
     for (CodingValidationRequest t : codes) {
-      t.setCacheToken(txCache != null ? txCache.generateValidationToken(options, t.getCoding(), vs, getExpansionParameters()) : null);
+      t.setCacheToken(txCache != null ? txCache.generateValidationToken(options, t.getCoding(), vs, expParametersForCacheToken()) : null);
       if (t.getCoding().hasSystem()) {
         codeSystemsUsed.add(t.getCoding().getSystem());
       }
@@ -1448,7 +1448,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       codeSystemsUsed.add(code.getSystem());
     }
 
-    final CacheToken cacheToken = cachingAllowed && txCache != null ? txCache.generateValidationToken(options, code, vs, getExpansionParameters()) : null;
+    final CacheToken cacheToken = cachingAllowed && txCache != null ? txCache.generateValidationToken(options, code, vs, expParametersForCacheToken()) : null;
     ValidationResult res = null;
     if (cachingAllowed && txCache != null) {
       res = txCache.getValidation(cacheToken);
@@ -1601,7 +1601,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return null;
     }
 
-    final CacheToken cacheToken = cachingAllowed && txCache != null ? txCache.generateSubsumesToken(options, parent, child, getExpansionParameters()) : null;
+    final CacheToken cacheToken = cachingAllowed && txCache != null ? txCache.generateSubsumesToken(options, parent, child, expParametersForCacheToken()) : null;
     if (cachingAllowed && txCache != null) {
       Boolean res = txCache.getSubsumes(cacheToken);
       if (res != null) {
@@ -1736,7 +1736,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   @Override
   public ValidationResult validateCode(ValidationOptions options, CodeableConcept code, ValueSet vs) {
-    CacheToken cacheToken = txCache.generateValidationToken(options, code, vs, getExpansionParameters());
+    CacheToken cacheToken = txCache.generateValidationToken(options, code, vs, expParametersForCacheToken());
     ValidationResult res = null;
     if (cachingAllowed) {
       res = txCache.getValidation(cacheToken);
@@ -2312,9 +2312,29 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     return parameters == null ? null : parameters.copy();
   }
 
+  /**
+   * The internal (identity-stable) expansion parameters instance, for terminology cache-key generation only.
+   * <p>
+   * TerminologyCache.generateValidationToken/generateSubsumesToken only ever <i>serialize</i> the Parameters
+   * they are given (they never mutate them, and never retain them beyond the serialization memo), and
+   * BaseWorkerContext never mutates the held instance in place - every internal update (e.g. {@link #setLocale})
+   * copies and then {@code set()}s a brand-new instance. So it is safe to hand the cache the stable internal
+   * instance, which lets its identity-keyed serialization memo engage. {@link #getExpansionParameters()} is
+   * deliberately not used for this, because it returns a fresh copy on every call, which would make the memo
+   * permanently miss.
+   */
+  private Parameters expParametersForCacheToken() {
+    return expansionParameters.get();
+  }
+
   public void setExpansionParameters(Parameters expansionParameters) {
     this.expansionParameters.set(expansionParameters);
     this.terminologyClientManager.setExpansionParameters(expansionParameters);
+    if (txCache != null) {
+      // the terminology cache memoizes the serialized form of the expansion parameters; a new (or replaced)
+      // parameters object must drop that memo so stale JSON can never be used in a cache key
+      txCache.clearExpParametersMemo();
+    }
   }
 
   @Override

@@ -1006,8 +1006,9 @@ public class Utilities {
     if (value == null)
       return "";
 
-    StringBuilder b = new StringBuilder();
-    for (char c : value.toCharArray()) {
+    StringBuilder b = new StringBuilder(value.length());
+    for (int i = 0; i < value.length(); i++) {
+      char c = value.charAt(i);
       if (c == '\r')
         b.append("\\r");
       else if (c == '\n')
@@ -1020,7 +1021,7 @@ public class Utilities {
         b.append("\\\\");
       else if (c == ' ')
         b.append(" ");
-      else if ((c == '\r' || c == '\n') || (isWhitespace(c) && escapeUnicodeWhitespace)) { 
+      else if ((c == '\r' || c == '\n') || (isWhitespace(c) && escapeUnicodeWhitespace)) {
         b.append("\\u"+Utilities.padLeft(Integer.toHexString(c), '0', 4));
       } else if (((int) c) < 32)
         b.append("\\u" + Utilities.padLeft(Integer.toHexString(c), '0', 4));
@@ -1770,10 +1771,18 @@ public class Utilities {
   }
 
   // from https://en.wikipedia.org/wiki/Whitespace_character#Unicode  
+  // implemented as a switch rather than existsInList to avoid allocating a varargs int[] per character
+  // on very hot paths (e.g. escapeJson)
   public static boolean isWhitespace(int ch) {
-    return Utilities.existsInList(ch, '\u0009', '\n', '\u000B','\u000C','\r','\u0020','\u0085','\u00A0',
-        '\u1680','\u2000','\u2001','\u2002','\u2003','\u2004','\u2005','\u2006','\u2007','\u2008','\u2009','\u200A',
-        '\u2028', '\u2029', '\u202F', '\u205F', '\u3000');
+    switch (ch) {
+    case '\u0009': case '\n': case '\u000B': case '\u000C': case '\r': case '\u0020': case '\u0085': case '\u00A0':
+    case '\u1680': case '\u2000': case '\u2001': case '\u2002': case '\u2003': case '\u2004': case '\u2005':
+    case '\u2006': case '\u2007': case '\u2008': case '\u2009': case '\u200A':
+    case '\u2028': case '\u2029': case '\u202F': case '\u205F': case '\u3000':
+      return true;
+    default:
+      return false;
+    }
   }
 
   public static boolean stringsEqual(String s1, String s2) {

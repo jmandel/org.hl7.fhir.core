@@ -120,10 +120,15 @@ public class JsonCreatorCanonical implements JsonCreator {
   JsonCreatorDirect jj;
   String name;
   
-  public JsonCreatorCanonical(OutputStreamWriter osw) {
+  public JsonCreatorCanonical(java.io.Writer osw) { // widened from OutputStreamWriter so callers can pass a BufferedWriter
     stack = new Stack<JsonCreatorCanonical.JsonCanObject>();
     jj = new JsonCreatorDirect(osw, false, false);
     name = null;
+  }
+
+  /** binary-compatibility overload: the constructor historically took an OutputStreamWriter */
+  public JsonCreatorCanonical(java.io.OutputStreamWriter osw) {
+    this((java.io.Writer) osw);
   }
 
   private String takeName() {

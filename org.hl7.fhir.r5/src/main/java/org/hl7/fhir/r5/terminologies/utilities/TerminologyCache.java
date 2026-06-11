@@ -38,6 +38,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -509,6 +510,122 @@ public class TerminologyCache {
   }
 
 
+  // ----- memoization of the invariant parts of cache key generation ---------------------------------------
+  // The expansion Parameters instance is passed unchanged on every validateCode call, and the ValueSet
+  // instances are shared and stable during validation, so the pretty-printed JSON fragments used in the cache
+  // key (which must remain byte-identical so that the persistent cache files stay compatible) can be computed
+  // once per instance and reused, instead of being re-serialized on every single validateCode call.
+
+  private static final class ExpParametersJson {
+    private final Parameters params;
+    private final int paramCount;
+    private final int partCount;
+    private final String json;
+    ExpParametersJson(Parameters params, String json) {
+      this.params = params;
+      this.paramCount = params.getParameter().size();
+      this.partCount = countParts(params);
+      this.json = json;
+    }
+    boolean matches(Parameters expParameters) {
+      // identity plus cheap structural checks (top-level parameter count and total nested part count),
+      // so that an in-place mutation of the same instance that adds/removes parameters or parts is detected
+      return params == expParameters
+          && paramCount == expParameters.getParameter().size()
+          && partCount == countParts(expParameters);
+    }
+    private static int countParts(Parameters params) {
+      int n = 0;
+      for (Parameters.ParametersParameterComponent p : params.getParameter()) {
+        n += p.getPart().size();
+      }
+      return n;
+    }
+  }
+  private volatile ExpParametersJson expParametersJsonMemo;
+
+  /**
+   * Invalidates the memoized serialization of the expansion parameters. Called by BaseWorkerContext
+   * whenever its expansion parameters object is set or replaced, so a mutated-then-reused Parameters
+   * instance can never be paired with a stale serialization.
+   */
+  public void clearExpParametersMemo() {
+    expParametersJsonMemo = null;
+  }
+
+  private String composeExpParamsJson(JsonParser json, Parameters expParameters) throws IOException {
+    if (expParameters == null) {
+      return json.composeString(expParameters); // preserve original behavior for null
+    }
+    ExpParametersJson memo = expParametersJsonMemo;
+    if (memo != null && memo.matches(expParameters)) {
+      return memo.json;
+    }
+    String s = json.composeString(expParameters);
+    expParametersJsonMemo = new ExpParametersJson(expParameters, s);
+    return s;
+  }
+
+  private static final class VsEssenceJson {
+    private final String json;
+    private final int composeIncludes;
+    private final int composeExcludes;
+    private final int expansionContains;
+    private final int expansionParams;
+    private final int firstIncludeConcepts; // extracted() branches on this being > 1000
+    private final int includeVersionsHash;  // detects in-place changes to include version pinning
+    VsEssenceJson(ValueSet vs, String json) {
+      this.json = json;
+      this.composeIncludes = vs.getCompose().getInclude().size();
+      this.composeExcludes = vs.getCompose().getExclude().size();
+      this.expansionContains = vs.getExpansion().getContains().size();
+      this.expansionParams = vs.getExpansion().getParameter().size();
+      this.firstIncludeConcepts = firstIncludeConceptCount(vs);
+      this.includeVersionsHash = includeVersionsHash(vs);
+    }
+    // Guards against in-place structural mutation of a memoized ValueSet: list sizes at every level the
+    // cache key serialization depends on, the first include's concept count (because extracted() switches
+    // to url-only form when it exceeds 1000), and a deterministic hash of the include version fields.
+    // Residual assumption (documented, not checked): a shared ValueSet is not otherwise mutated in place
+    // (e.g. editing a concept code without changing any list size or include version) while validation is
+    // running. Worker contexts treat handed-out ValueSets as immutable during validation, so this holds in
+    // practice; a violation would also have corrupted the pre-memoization cache keys mid-run.
+    boolean matches(ValueSet vs) {
+      return composeIncludes == vs.getCompose().getInclude().size()
+          && composeExcludes == vs.getCompose().getExclude().size()
+          && expansionContains == vs.getExpansion().getContains().size()
+          && expansionParams == vs.getExpansion().getParameter().size()
+          && firstIncludeConcepts == firstIncludeConceptCount(vs)
+          && includeVersionsHash == includeVersionsHash(vs);
+    }
+    private static int firstIncludeConceptCount(ValueSet vs) {
+      // deliberately not getIncludeFirstRep(): that would *add* an include to an empty compose
+      List<ConceptSetComponent> includes = vs.getCompose().getInclude();
+      return includes.isEmpty() ? 0 : includes.get(0).getConcept().size();
+    }
+    private static int includeVersionsHash(ValueSet vs) {
+      int h = 1;
+      for (ConceptSetComponent inc : vs.getCompose().getInclude()) {
+        h = 31 * h + (inc.hasVersion() ? inc.getVersion().hashCode() : 0);
+      }
+      return h;
+    }
+  }
+  // ValueSet does not override equals/hashCode, so this WeakHashMap is effectively identity-keyed,
+  // and entries disappear when the ValueSet is no longer referenced elsewhere
+  private final Map<ValueSet, VsEssenceJson> vsEssenceJsonMemo = Collections.synchronizedMap(new WeakHashMap<>());
+
+  /** byte-identical replacement for extracted(json, getVSEssense(vs)), memoized per ValueSet instance */
+  private String vsEssenceJson(JsonParser json, ValueSet vs) throws IOException {
+    VsEssenceJson memo = vsEssenceJsonMemo.get(vs);
+    if (memo != null && memo.matches(vs)) {
+      return memo.json;
+    }
+    String s = extracted(json, getVSEssense(vs));
+    vsEssenceJsonMemo.put(vs, new VsEssenceJson(vs, s));
+    return s;
+  }
+
   public CacheToken generateValidationToken(ValidationOptions options, Coding code, ValueSet vs, Parameters expParameters) {
     try {
       CacheToken ct = new CacheToken();
@@ -521,7 +638,7 @@ public class TerminologyCache {
       nameCacheToken(vs, ct);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = expParameters == null ? "" : json.composeString(expParameters);
+      String expJS = expParameters == null ? "" : composeExpParamsJson(json, expParameters);
 
       if (vs != null && vs.hasUrl() && vs.hasVersion()) {
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())
@@ -529,8 +646,7 @@ public class TerminologyCache {
       } else if (options.getVsAsUrl()) {
         ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+extracted(json, vs)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       } else {
-        ValueSet vsc = getVSEssense(vs);
-        ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vsc == null ? "null" : extracted(json, vsc))+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
+        ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vs == null ? "null" : vsEssenceJson(json, vs))+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
@@ -551,7 +667,7 @@ public class TerminologyCache {
       ct.setName(vsUrl);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
 
       ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vsUrl == null ? "null" : vsUrl)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       ct.key = String.valueOf(hashJson(ct.request));
@@ -583,15 +699,14 @@ public class TerminologyCache {
       nameCacheToken(vs, ct);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
       if (vs != null && vs.hasUrl() && vs.hasVersion()) {
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())+
             "\", \"version\": \""+Utilities.escapeJson(vs.getVersion())+"\""+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}\r\n";      
       } else if (vs == null) { 
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";        
       } else {
-        ValueSet vsc = getVSEssense(vs);
-        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"valueSet\" :"+extracted(json, vsc)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
+        ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"valueSet\" :"+vsEssenceJson(json, vs)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
@@ -618,11 +733,10 @@ public class TerminologyCache {
     if (vs.hasUrl() && vs.hasVersion()) {
       ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"url\": \""+Utilities.escapeJson(vs.getUrl())+"\", \"version\": \""+Utilities.escapeJson(vs.getVersion())+"\"}\r\n";
     } else {
-      ValueSet vsc = getVSEssense(vs);
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
       try {
-        ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"valueSet\" :"+extracted(json, vsc)+"}\r\n";
+        ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"valueSet\" :"+vsEssenceJson(json, vs)+"}\r\n";
       } catch (IOException e) {
         throw new Error(e);
       }
@@ -826,7 +940,7 @@ public class TerminologyCache {
       return;
 
     try {
-      OutputStreamWriter sw = new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, title + CACHE_FILE_EXTENSION)), "UTF-8");
+      Writer sw = new BufferedWriter(new OutputStreamWriter(ManagedFileAccess.outStream(Utilities.path(folder, title + CACHE_FILE_EXTENSION)), "UTF-8"));
 
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
@@ -1422,7 +1536,7 @@ public class TerminologyCache {
       ct.hasVersion = parent.hasVersion() || child.hasVersion();
       JsonParser json = new JsonParser();
       json.setOutputStyle(OutputStyle.PRETTY);
-      String expJS = json.composeString(expParameters);
+      String expJS = composeExpParamsJson(json, expParameters);
       ct.request = "{\"op\": \"subsumes\", \"parent\" : "+json.composeString(parent, "code")+", \"child\" :"+json.composeString(child, "code")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       ct.key = String.valueOf(hashJson(ct.request));
       return ct;
