@@ -1265,19 +1265,31 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       }      
     }  
 
+    List<CodingValidationRequest> shadowItems = null;
     for (CodingValidationRequest t : codes) {
       if (!t.hasResult()) {
         String codeKey = t.getCoding().hasVersion() ? t.getCoding().getSystem()+"|"+t.getCoding().getVersion() : t.getCoding().getSystem();
         if (!options.isUseServer()) {
          t.setResult(new ValidationResult(IssueSeverity.WARNING,formatMessage(I18nConstants.UNABLE_TO_VALIDATE_CODE_WITHOUT_USING_SERVER), TerminologyServiceErrorClass.BLOCKED_BY_OPTIONS, null));
         } else if (unsupportedCodeSystems.contains(codeKey)) {
-          t.setResult(new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, t.getCoding().getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, null));      
+          t.setResult(new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, t.getCoding().getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, null));
+          // SHADOW RECORDING (recording runs only): the suppression above answers the request locally
+          // and excludes it from the server batch, so the request shape would never reach the
+          // recorded pack; remember it so the exact request is still sent (and its answer cached)
+          // after the real batch below, without touching the result we just set.
+          if (TerminologyCache.isRecordSemanticErrors() && txCache != null && t.getCacheToken() != null
+              && !noTerminologyServer && terminologyClientManager.hasClient()) {
+            if (shadowItems == null) {
+              shadowItems = new ArrayList<>();
+            }
+            shadowItems.add(t);
+          }
         } else if (noTerminologyServer) {
           t.setResult(new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.ERROR_VALIDATING_CODE_RUNNING_WITHOUT_TERMINOLOGY_SERVICES, t.getCoding().getCode(), t.getCoding().getSystem()), TerminologyServiceErrorClass.NOSERVICE, null));
         }
       }
     }
-    
+
     if (expansionParameters.get() == null)
       throw new Error(formatMessage(I18nConstants.NO_EXPANSIONPROFILE_PROVIDED));
     // for those that that failed, we try to validate on the server
@@ -1316,10 +1328,14 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
             txCache.cacheValidation(t.getCacheToken(), t.getResult(), TerminologyCache.PERMANENT);
           }
         } else {
-          t.setResult(new ValidationResult(IssueSeverity.ERROR, getResponseText(r.getResource()), null).setTxLink(txLog == null ? null : txLog.getLastId()));          
+          t.setResult(new ValidationResult(IssueSeverity.ERROR, getResponseText(r.getResource()), null).setTxLink(txLog == null ? null : txLog.getLastId()));
         }
       }
-    }    
+    }
+
+    if (shadowItems != null) {
+      shadowRecordSuppressedBatchValidation(options, shadowItems, vs, passVS);
+    }
   }
 
   private Parameters processBatch(TerminologyClientContext tc, Parameters batch, Set<String> systems, int size) {
@@ -1582,7 +1598,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
     String codeKey = getCodeKey(code);
     if (unsupportedCodeSystems.contains(codeKey)) {
-      return new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, issues);      
+      // SHADOW RECORDING (recording runs only): the per-run suppression below answers this request
+      // locally, so without this the recorded pack would only carry the FIRST probe shape per
+      // unknown system; the shadow sends the exact request the un-suppressed path would have sent,
+      // caches the answer (making it packable), and changes nothing about what this call returns.
+      shadowRecordSuppressedCodingValidation(cacheToken, options, code, vs, localError, localWarning, type, codeKey);
+      return new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, issues);
     }
     
     // if that failed, we try to validate on the server
@@ -1668,8 +1689,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       }
     }
 
+    // no SHADOW RECORDING here (see the shadow-recording notes below): the un-suppressed path never
+    // caches server subsumes responses, so a shadow cache write would create state no normal run has
+    // and the cached Boolean would observably replace this null on the next identical ask
     if (!terminologyClientManager.hasClient() || !options.isUseServer() || unsupportedCodeSystems.contains(parent.getSystem()) || unsupportedCodeSystems.contains(child.getSystem()) || noTerminologyServer) {
-      return null;      
+      return null;
     }
 
     Set<String> systems = new HashSet<>();
@@ -1764,6 +1788,111 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   private void updateUnsupportedCodeSystems(ValidationResult res, Coding code, String codeKey) {
     if (res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && !code.hasVersion() && fetchCodeSystem(codeKey, ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) == null) {
       unsupportedCodeSystems.add(codeKey);
+    }
+  }
+
+  // ---- SHADOW RECORDING of suppressed unknown-system server asks -------------------------------
+  //
+  // During a recording run (-Dorg.hl7.fhir.tx.recordSemanticErrors=true) the per-run
+  // unsupportedCodeSystems memo answers every probe after the first per unknown system locally, so
+  // the recorded pack carries only ONE request shape per unknown system. A replay run, whose
+  // suppression state evolves under different thread timing, encounters a different shape first,
+  // misses the pack, and goes to the server (~91 residual requests/run measured on the spec build).
+  //
+  // The shadow makes recording runs exhaustive: at each suppression point, when recording is active
+  // and a request is about to be answered from the memo, the EXACT server request the un-suppressed
+  // path would have sent is sent synchronously through the normal validateOnServer2/processBatch
+  // machinery and its answer is written to the TerminologyCache through the normal store (where the
+  // recordSemanticErrors rescue makes the CODESYSTEM_UNSUPPORTED answers persistent and packable).
+  // The caller still receives the memo answer, exactly as without the flag: the shadow result is
+  // never assigned to any caller-visible state, so a recording run's observable output is unchanged.
+  // For replay, the recorded entry is post-processed exactly the way the live, un-suppressed path
+  // post-processes a server answer before returning it, so a pack hit serves the same bytes a live
+  // round-trip (today's residual traffic) would have produced.
+  //
+  // Dedupe: the cache token lookup (txCache.getValidation) precedes both suppression points, and the
+  // shadow writes its answer under that same token, so each unique request shape is shadow-sent at
+  // most once per run (concurrent first asks of the same shape may race, like the normal path; both
+  // write identical content).
+  //
+  // The other two unknown-system short-circuits need no shadow:
+  //  - synthesizeUnknownSystemResult: the synthesized result (errorClass UNKNOWN) flows on to the
+  //    normal cacheValidation(PERMANENT) at the end of validateCode and is byte-identical to the
+  //    server's canonical answer by construction, so every suppressed token is already packable.
+  //  - subsumes: the normal path never caches server subsumes responses at all, so there is nothing
+  //    a pack could serve; a shadow cache write would create cache state no normal run ever has and
+  //    getSubsumes would then serve a Boolean where the un-shadowed run observably returns null.
+
+  private void shadowRecordSuppressedCodingValidation(CacheToken cacheToken, ValidationOptions options, Coding code, ValueSet vs,
+      String localError, String localWarning, TerminologyServiceErrorClass type, String codeKey) {
+    if (!TerminologyCache.isRecordSemanticErrors() || txCache == null || !cachingAllowed || cacheToken == null
+        || noTerminologyServer || !terminologyClientManager.hasClient()) {
+      return;
+    }
+    try {
+      Set<String> systems = findRelevantSystems(code, vs);
+      TerminologyClientContext tc = terminologyClientManager.chooseServer(vs, systems, false);
+      txLog("$validate (shadow-record) "+txCache.summary(code)+(vs == null ? "" : " for "+txCache.summary(vs))+" on "+tc.getAddress());
+      ValidationResult res;
+      try {
+        Parameters pIn = constructParameters(options, code);
+        res = validateOnServer2(tc, vs, pIn, options, systems);
+      } catch (Exception e) {
+        return; // a failed shadow request is simply not recorded
+      }
+      // mirror the post-processing the un-suppressed path applies to a server answer before
+      // returning/caching it (see validateCode above), so the recorded entry carries the same bytes
+      // a live round-trip would have handed the caller. The memos (unsupportedCodeSystems /
+      // serverConfirmedUnknownSystems) are deliberately NOT updated here: the suppression that
+      // brought us here is already armed, and a non-recording run would not have asked the server.
+      if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && (localError != null && !localError.equals(ValueSetValidator.NO_TRY_THE_SERVER))) {
+        res = new ValidationResult(IssueSeverity.ERROR, localError, null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(type);
+      }
+      if (!res.isOk() && localError != null) {
+        res.setDiagnostics("Local Error: "+localError.trim()+". Server Error: "+res.getMessage());
+      } else if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && res.getUnknownSystems() != null && res.getUnknownSystems().contains(codeKey) && localWarning != null) {
+        res = new ValidationResult(IssueSeverity.WARNING, localWarning, null);
+        res.setDiagnostics("Local Warning: "+localWarning.trim()+". Server Error: "+res.getMessage());
+      }
+      txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
+    } catch (Exception e) {
+      // shadow recording must never alter the run's observable behaviour
+    }
+  }
+
+  private void shadowRecordSuppressedBatchValidation(ValidationOptions options, List<CodingValidationRequest> items, ValueSet vs, boolean passVS) {
+    try {
+      // same batch construction as validateCodeBatch's real server section
+      Parameters batch = new Parameters();
+      Set<String> systems = findRelevantSystems(vs);
+      if (vs != null) {
+        if (passVS) {
+          batch.addParameter().setName("tx-resource").setResource(vs);
+        }
+        batch.addParameter("url", vs.getUrl());
+      }
+      for (CodingValidationRequest t : items) {
+        Parameters pIn = constructParameters(options, t);
+        setTerminologyOptions(options, pIn);
+        batch.addParameter().setName("validation").setResource(pIn);
+        systems.add(t.getCoding().getSystem());
+        findRelevantSystems(systems, t.getCoding());
+      }
+      TerminologyClientContext tc = terminologyClientManager.chooseServer(vs, systems, false);
+      txLog("$batch validate (shadow-record) for "+items.size()+" codes on systems "+systems.toString());
+      Parameters resp = processBatch(tc, batch, systems, items.size());
+      List<ParametersParameterComponent> validations = resp.getParameters("validation");
+      for (int i = 0; i < items.size() && i < validations.size(); i++) {
+        ParametersParameterComponent r = validations.get(i);
+        if (r.getResource() instanceof Parameters) {
+          // cache write only - mirrors the real batch section, which caches the raw
+          // processValidationResult; t.setResult is never touched (the suppressed answer stands)
+          ValidationResult vr = processValidationResult((Parameters) r.getResource(), null, tc.getAddress());
+          txCache.cacheValidation(items.get(i).getCacheToken(), vr, TerminologyCache.PERMANENT);
+        }
+      }
+    } catch (Exception e) {
+      // shadow recording must never alter the run's observable behaviour
     }
   }
 
@@ -2242,6 +2371,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
    * Once a real server round-trip has confirmed (in canonical shape - see maybeRecordServerUnknownSystem)
    * that it does not know a code system, answer subsequent gate-shaped asks for the same system locally
    * with the same fully parameterized result the server would return.
+   *
+   * <p>No SHADOW RECORDING is needed at this suppression point (unlike the unsupportedCodeSystems
+   * memo): the synthesized result has errorClass UNKNOWN, so it flows on to the normal
+   * cacheValidation(PERMANENT) at the end of validateCode and is persisted in every mode - and it is
+   * byte-identical to the server's canonical answer by construction, so the pack entry a recording
+   * run writes for a suppressed token is the same one an un-suppressed round trip would have written.
    */
   private ValidationResult synthesizeUnknownSystemResult(ValidationOptions options, Coding code, ValueSet vs, String localError) {
     if (!unknownSynthGate(options, code, vs, localError) || !serverConfirmedUnknownSystems.contains(code.getSystem())) {
@@ -2406,6 +2541,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (noTerminologyServer) {
       return new ValidationResult(IssueSeverity.ERROR, "Error validating code: running without terminology services", TerminologyServiceErrorClass.NOSERVICE, null);
     }
+    // note: this CodeableConcept path has NO unknown-system suppression (neither unsupportedCodeSystems
+    // nor serverConfirmedUnknownSystems is consulted), so every CC shape that local evaluation cannot
+    // answer reaches the server and is cached PERMANENT below; recording runs are therefore naturally
+    // exhaustive here (the recordSemanticErrors store rescue persists the CODESYSTEM_UNSUPPORTED
+    // answers) and no shadow recording is needed - see the shadow-recording notes above
     Set<String> systems = findRelevantSystems(code, vs);
     TerminologyClientContext tc = terminologyClientManager.chooseServer(vs, systems, false);
 
