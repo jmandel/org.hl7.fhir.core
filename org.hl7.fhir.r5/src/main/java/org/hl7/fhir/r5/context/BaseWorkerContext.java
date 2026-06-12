@@ -48,6 +48,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import lombok.EqualsAndHashCode;
@@ -409,6 +410,10 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       userAgent = other.userAgent;
       terminologyClientManager.copy(other.terminologyClientManager);
       cachingAllowed = other.cachingAllowed;
+      // seed the run-scoped local-evaluation memos from the source context: entries are immutable
+      // from the maps' point of view (defensively copied on read), so sharing them is safe
+      localValidationMemo.putAll(other.localValidationMemo);
+      localExpansionMemo.putAll(other.localExpansionMemo);
       suppressedMappings = other.suppressedMappings;
       cutils.setSuppressedMappings(other.suppressedMappings);
     }
@@ -1103,22 +1108,36 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
 
     List<String> allErrors = new ArrayList<>();
-    
-    // ok, first we try to expand locally
-    ValueSetExpander vse = constructValueSetExpanderSimple(new ValidationOptions(vs.getFHIRPublicationVersion()));
-    vse.setNoTerminologyServer(noTerminologyServer);
-    res = null;
-    try {
-      res = vse.expand(vs, p);
-      if (res != null && res.getValueset() != null) { 
-        res.getValueset().setUserData(UserDataNames.VS_EXPANSION_SOURCE, vse.getSource());
+
+    // run-scoped, content-keyed memo of the local expansion attempt - success AND failure: on a cold
+    // terminology cache the same expensive local expansion (or expensive failure-to-expand, e.g. the
+    // too-costly decision, which the stock code never caches anywhere) is otherwise re-ground for
+    // every file that touches the value set. Only the local attempt is memoized; the server
+    // fallthrough below still runs and is owned by the TerminologyCache. See evalMemo notes.
+    final String evalMemoKey = localExpansionMemoKey(vs, p);
+    final LocalExpansionMemo evalMemoHit = evalMemoKey != null ? localExpansionMemo.get(evalMemoKey) : null;
+    if (evalMemoHit != null) {
+      res = evalMemoHit.read(allErrors);
+    } else {
+      // ok, first we try to expand locally
+      ValueSetExpander vse = constructValueSetExpanderSimple(new ValidationOptions(vs.getFHIRPublicationVersion()));
+      vse.setNoTerminologyServer(noTerminologyServer);
+      res = null;
+      try {
+        res = vse.expand(vs, p);
+        if (res != null && res.getValueset() != null) {
+          res.getValueset().setUserData(UserDataNames.VS_EXPANSION_SOURCE, vse.getSource());
+        }
+      } catch (Exception e) {
+        allErrors.addAll(vse.getAllErrors());
+        e.printStackTrace();
+        res = new ValueSetExpansionOutcome(e.getMessage(), TerminologyServiceErrorClass.UNKNOWN, e instanceof EFhirClientException);
       }
-    } catch (Exception e) {
       allErrors.addAll(vse.getAllErrors());
-      e.printStackTrace();
-      res = new ValueSetExpansionOutcome(e.getMessage(), TerminologyServiceErrorClass.UNKNOWN, e instanceof EFhirClientException);
+      if (evalMemoKey != null && res != null && localExpansionMemo.size() < EVAL_MEMO_MAX_EXPANSION_ENTRIES) {
+        localExpansionMemo.putIfAbsent(evalMemoKey, new LocalExpansionMemo(res, allErrors));
+      }
     }
-    allErrors.addAll(vse.getAllErrors());
     if (res.getValueset() != null) {
       if (!res.getValueset().hasUrl()) {
         throw new Error(formatMessage(I18nConstants.NO_URL_IN_EXPAND_VALUE_SET));
@@ -1218,10 +1237,24 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (options.isUseClient()) {
       for (CodingValidationRequest t : codes) {
         if (!t.hasResult()) {
+          // run-scoped, content-keyed memo of the local evaluation. This path hands the validator
+          // the caller's own Coding object, which the validator mutates when it has no system
+          // (setSystem / tx_val_sys_error userData), so system-less codings are never memoized
+          // here; see evalMemo notes.
+          String evalMemoKey = t.getCoding().hasSystem() ? localValidationMemoKey("v-coding-batch", "Coding", t.getCoding(), options, vs) : null;
+          ValidationResult evalMemoHit = localValidationMemoGet(evalMemoKey);
+          if (evalMemoHit != null) {
+            if (txCache != null) {
+              txCache.cacheValidation(t.getCacheToken(), evalMemoHit, TerminologyCache.TRANSIENT);
+            }
+            t.setResult(evalMemoHit);
+            continue;
+          }
           try {
             ValueSetValidator vsc = constructValueSetCheckerSimple(options, vs);
             vsc.setThrowToServer(options.isUseServer() && terminologyClientManager.hasClient());
             ValidationResult res = vsc.validateCode("Coding", t.getCoding());
+            localValidationMemoPut(evalMemoKey, res);
             if (txCache != null) {
               txCache.cacheValidation(t.getCacheToken(), res, TerminologyCache.TRANSIENT);
             }
@@ -1458,6 +1491,21 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     String localWarning = null;
     TerminologyServiceErrorClass type = TerminologyServiceErrorClass.UNKNOWN;
     if (options.isUseClient()) {
+      // run-scoped, content-keyed memo of the local evaluation (before any server fallthrough
+      // decision). The validator is always handed a fresh code.copy() on this path, so the result
+      // is purely content-determined; requests carrying un-keyed context (ValidationContextCarrier
+      // resources, external source) return a null key and are never memoized. See evalMemo notes.
+      String evalMemoKey = null;
+      if (!ValueSetUtilities.isServerSide(code.getSystem()) && (ctxt == null || ctxt.getResources() == null || ctxt.getResources().isEmpty())) {
+        evalMemoKey = localValidationMemoKey("v-coding", path, code, options, vs);
+        ValidationResult evalMemoHit = localValidationMemoGet(evalMemoKey);
+        if (evalMemoHit != null) {
+          if (txCache != null && cachingAllowed) {
+            txCache.cacheValidation(cacheToken, evalMemoHit, TerminologyCache.TRANSIENT);
+          }
+          return evalMemoHit;
+        }
+      }
       // ok, first we try to validate locally
       try {
         ValueSetValidator vsc = constructValueSetCheckerSimple(options, vs, ctxt);
@@ -1469,6 +1517,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         vsc.setExternalSource((CanonicalResource) options.getExternalSource());
         if (!ValueSetUtilities.isServerSide(code.getSystem())) {
           res = vsc.validateCode(path, code.copy());
+          localValidationMemoPut(evalMemoKey, res);
           if (txCache != null && cachingAllowed) {
             txCache.cacheValidation(cacheToken, res, TerminologyCache.TRANSIENT);
           }
@@ -1715,6 +1764,329 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   private void updateUnsupportedCodeSystems(ValidationResult res, Coding code, String codeKey) {
     if (res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && !code.hasVersion() && fetchCodeSystem(codeKey, ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) == null) {
       unsupportedCodeSystems.add(codeKey);
+    }
+  }
+
+  // ---- run-scoped, content-keyed memoization of local terminology evaluation -------------------
+  //
+  // On a cold terminology cache, the *local* evaluation work (ValueSetValidator membership walks,
+  // local ValueSet expansions - including expensive *failures* to expand locally, which the stock
+  // code never records anywhere) is recomputed for every file that touches the same value set.
+  // Local evaluation is deterministic given the same content (any nested server consultations go
+  // through the TerminologyCache and are therefore stable within a run), so we memoize it for the
+  // lifetime of this context, keyed purely by CONTENT, never by object identity (the
+  // expParametersForCacheToken() comment above documents why identity-keying Parameters is a trap):
+  //
+  //  - sha256 over the canonical JSON of the ValueSet, of every directly relevant CodeSystem
+  //    (+ its supplements) and of one level of imported value sets, interned on the resource
+  //    instance via userData (synchronized accessors on this branch). Interned hashes are never
+  //    invalidated in place; the documented assumption - the same one the terminology cache key
+  //    memoization on this branch already relies on - is that conformance resources are effectively
+  //    immutable while validation runs. Replacing a resource (cacheResource/dropResource) installs
+  //    a *new* object, which misses the intern and is hashed afresh, and the "url=hash|absent"
+  //    entries below make the memo key change when a resource arrives, departs, or is replaced
+  //    mid-run.
+  //  - the canonical JSON of the small per-request inputs: coding / codeable-concept / merged
+  //    expansion parameters / ValidationOptions.toJson() / locale / the flags that steer the local
+  //    evaluator (hasClient -> throwToServer, noTerminologyServer).
+  //
+  // Results are DEFENSIVELY COPIED both into and out of the memo: callers mutate returned objects
+  // (setDiagnostics, trimPath, expansion edits), and the copy cost is trivial vs recomputation.
+  // Scope guard rails:
+  //  - only the LOCAL evaluation outcome is memoized, always before any server fallthrough
+  //    decision is acted on; server responses are never stored here (TerminologyCache owns those)
+  //  - validations that depend on un-keyed context are skipped: ValidationContextCarrier with
+  //    resources, options.getExternalSource(), and (for call sites that hand the validator the
+  //    caller's own Coding/CodeableConcept object, which the validator mutates via
+  //    setSystem/tx_val_sys_error userData) codings without a system
+
+  private static final boolean EVAL_MEMO = !"false".equals(System.getProperty("org.hl7.fhir.tx.evalMemo"));
+  private static final String EVAL_MEMO_HASH_USER_DATA = "org.hl7.fhir.tx.evalMemo.contentHash";
+  private static final int EVAL_MEMO_MAX_VALIDATION_ENTRIES = 200000;
+  private static final int EVAL_MEMO_MAX_EXPANSION_ENTRIES = 20000;
+
+  private final Map<String, ValidationResult> localValidationMemo = new ConcurrentHashMap<>();
+  private final Map<String, LocalExpansionMemo> localExpansionMemo = new ConcurrentHashMap<>();
+
+  private static final class LocalExpansionMemo {
+    private final ValueSetExpansionOutcome outcome; // private to the memo: copied on the way in and on every read
+    private final List<String> allErrors;           // snapshot of the expander's error list at memo time
+    private final String expansionSource;           // VS_EXPANSION_SOURCE; userData is not carried by copy()
+
+    LocalExpansionMemo(ValueSetExpansionOutcome outcome, List<String> allErrors) {
+      this.outcome = outcome.copy();
+      this.allErrors = new ArrayList<>(allErrors);
+      this.expansionSource = outcome.getValueset() != null ? outcome.getValueset().getUserString(UserDataNames.VS_EXPANSION_SOURCE) : null;
+    }
+
+    ValueSetExpansionOutcome read(List<String> allErrorsOut) {
+      ValueSetExpansionOutcome res = outcome.copy();
+      if (res.getValueset() != null && expansionSource != null) {
+        res.getValueset().setUserData(UserDataNames.VS_EXPANSION_SOURCE, expansionSource);
+      }
+      allErrorsOut.addAll(allErrors);
+      return res;
+    }
+  }
+
+  /** content hash of a resource's canonical JSON, interned on the instance (recompute-on-miss only; see notes above) */
+  private String evalMemoContentHash(Resource r) {
+    if (r == null) {
+      return "null";
+    }
+    String hash = (String) r.getUserData(EVAL_MEMO_HASH_USER_DATA);
+    if (hash == null) {
+      hash = evalMemoSha256(evalMemoCanonicalJson(r));
+      if (hash != null) {
+        r.setUserData(EVAL_MEMO_HASH_USER_DATA, hash);
+      }
+    }
+    return hash;
+  }
+
+  private String evalMemoCanonicalJson(Resource r) {
+    try {
+      org.hl7.fhir.r5.formats.JsonParser json = new org.hl7.fhir.r5.formats.JsonParser();
+      json.setOutputStyle(org.hl7.fhir.r5.formats.IParser.OutputStyle.CANONICAL);
+      return json.composeString(r);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private String evalMemoCanonicalJson(DataType d, String name) {
+    try {
+      org.hl7.fhir.r5.formats.JsonParser json = new org.hl7.fhir.r5.formats.JsonParser();
+      json.setOutputStyle(org.hl7.fhir.r5.formats.IParser.OutputStyle.CANONICAL);
+      return json.composeString(d, name);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private static String evalMemoSha256(String s) {
+    if (s == null) {
+      return null;
+    }
+    try {
+      java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+      byte[] d = md.digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      StringBuilder b = new StringBuilder(d.length * 2);
+      for (byte x : d) {
+        b.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
+      }
+      return b.toString();
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  /**
+   * sorted "kind:url=hash|absent" fingerprint entries for the resources local evaluation can consult:
+   * the code systems (+ supplements) named by the value set's compose and by the coding itself, plus
+   * one level of imported value sets. Deliberately depth-limited - import cycles are tolerated by the
+   * evaluators themselves but would not be safe to chase here; content changes deeper than one import
+   * level are covered by the run-stable-resources assumption rather than by the key.
+   * Returns false when any piece could not be fingerprinted (caller must then skip the memo).
+   */
+  private boolean evalMemoAddValueSetEntries(java.util.TreeSet<String> entries, ValueSet vs, int depth) {
+    for (ConceptSetComponent inc : vs.getCompose().getInclude()) {
+      if (!evalMemoAddIncludeEntries(entries, inc, depth)) {
+        return false;
+      }
+    }
+    for (ConceptSetComponent exc : vs.getCompose().getExclude()) {
+      if (!evalMemoAddIncludeEntries(entries, exc, depth)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private boolean evalMemoAddIncludeEntries(java.util.TreeSet<String> entries, ConceptSetComponent inc, int depth) {
+    if (inc.hasSystem() && !evalMemoAddCodeSystemEntry(entries, inc.hasVersion() ? inc.getSystem()+"|"+inc.getVersion() : inc.getSystem())) {
+      return false;
+    }
+    for (CanonicalType u : inc.getValueSet()) {
+      if (u.getValue() == null) {
+        continue;
+      }
+      ValueSet ivs;
+      try {
+        ivs = fetchResource(ValueSet.class, u.getValue(), ExtensionUtilities.getVersionResolutionRules(inc));
+      } catch (Exception e) {
+        return false;
+      }
+      if (ivs == null) {
+        entries.add("vs:"+u.getValue()+"=absent");
+      } else {
+        String h = evalMemoContentHash(ivs);
+        if (h == null) {
+          return false;
+        }
+        entries.add("vs:"+u.getValue()+"="+h);
+        if (depth > 0 && !evalMemoAddValueSetEntries(entries, ivs, depth - 1)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  private boolean evalMemoAddCodeSystemEntry(java.util.TreeSet<String> entries, String system) {
+    if (system == null) {
+      return true;
+    }
+    CodeSystem cs;
+    try {
+      // plain CRM lookup (no locator, no implicit-codesystem conversion): cheap, and the implicit
+      // sources are themselves run-stable resources covered by the documented assumption
+      cs = fetchResource(CodeSystem.class, system, VersionResolutionRules.defaultRule());
+    } catch (Exception e) {
+      return false;
+    }
+    if (cs == null) {
+      entries.add("cs:"+system+"=absent");
+      return true;
+    }
+    String h = evalMemoContentHash(cs);
+    if (h == null) {
+      return false;
+    }
+    entries.add("cs:"+system+"="+h);
+    for (CodeSystem supp : getSupplementsLocked(cs)) {
+      String sh = evalMemoContentHash(supp);
+      if (sh == null) {
+        return false;
+      }
+      entries.add("sup:"+supp.getVersionedUrl()+"="+sh);
+    }
+    return true;
+  }
+
+  /** memo key for a local validateCode evaluation, or null when this request must not be memoized */
+  private String localValidationMemoKey(String op, String path, String codeJson, List<String> codeSystems, ValidationOptions options, ValueSet vs) {
+    if (!EVAL_MEMO || codeJson == null || options == null || options.getExternalSource() != null) {
+      return null;
+    }
+    try {
+      StringBuilder b = new StringBuilder(512);
+      b.append(op).append('\u0001').append(path).append('\u0001');
+      b.append(codeJson).append('\u0001');
+      b.append(options.toJson()).append('\u0001');
+      String vh = vs == null ? "null" : evalMemoContentHash(vs);
+      if (vh == null) {
+        return null;
+      }
+      b.append(vh).append('\u0001');
+      java.util.TreeSet<String> entries = new java.util.TreeSet<>();
+      if (vs != null && !evalMemoAddValueSetEntries(entries, vs, 1)) {
+        return null;
+      }
+      for (String sys : codeSystems) {
+        if (!evalMemoAddCodeSystemEntry(entries, sys)) {
+          return null;
+        }
+      }
+      for (String e : entries) {
+        b.append(e).append('\u0001');
+      }
+      // content (never identity) of the expansion parameters - see expParametersForCacheToken()
+      String eh = evalMemoContentHash(expansionParameters.get());
+      if (eh == null) {
+        return null;
+      }
+      b.append(eh).append('\u0001');
+      b.append(terminologyClientManager.hasClient()).append('\u0001');
+      b.append(noTerminologyServer).append('\u0001');
+      b.append(getLocale());
+      return evalMemoSha256(b.toString());
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  // the op separates call sites whose results are not interchangeable even for identical content
+  // (e.g. the batch path never sets the validator's unknownSystems set while the single path does,
+  // which changes the shape of the returned ValidationResult)
+  private String localValidationMemoKey(String op, String path, Coding code, ValidationOptions options, ValueSet vs) {
+    List<String> systems = new ArrayList<>();
+    if (code.hasSystem()) {
+      systems.add(code.hasVersion() ? code.getSystem()+"|"+code.getVersion() : code.getSystem());
+    }
+    return localValidationMemoKey(op, path, evalMemoCanonicalJson(code, "code"), systems, options, vs);
+  }
+
+  private String localValidationMemoKey(String op, String path, CodeableConcept code, ValidationOptions options, ValueSet vs) {
+    List<String> systems = new ArrayList<>();
+    for (Coding c : code.getCoding()) {
+      if (!c.hasSystem()) {
+        // the validator mutates system-less codings on the caller's own object (setSystem /
+        // tx_val_sys_error userData), so replaying a memoized result would skip caller-visible
+        // side effects and the result is not purely content-determined - don't memoize
+        return null;
+      }
+      systems.add(c.hasVersion() ? c.getSystem()+"|"+c.getVersion() : c.getSystem());
+    }
+    return localValidationMemoKey(op, path, evalMemoCanonicalJson(code, "codeableConcept"), systems, options, vs);
+  }
+
+  private ValidationResult localValidationMemoGet(String key) {
+    if (key == null) {
+      return null;
+    }
+    ValidationResult hit = localValidationMemo.get(key);
+    return hit == null ? null : evalMemoCopyResult(hit);
+  }
+
+  private void localValidationMemoPut(String key, ValidationResult res) {
+    if (key != null && res != null && localValidationMemo.size() < EVAL_MEMO_MAX_VALIDATION_ENTRIES) {
+      localValidationMemo.putIfAbsent(key, evalMemoCopyResult(res));
+    }
+  }
+
+  /** the ValidationResult copy constructor does not carry errorIsDisplayIssue/parameters; this does */
+  private static ValidationResult evalMemoCopyResult(ValidationResult res) {
+    ValidationResult copy = new ValidationResult(res);
+    copy.setErrorIsDisplayIssue(res.isErrorIsDisplayIssue());
+    if (res.getParameters() != null) {
+      copy.setParameters(res.getParameters().copy());
+    }
+    return copy;
+  }
+
+  /** memo key for a local expansion attempt, or null when this request must not be memoized */
+  private String localExpansionMemoKey(ValueSet vs, Parameters p) {
+    if (!EVAL_MEMO) {
+      return null;
+    }
+    try {
+      StringBuilder b = new StringBuilder(512);
+      b.append("expand").append('\u0001');
+      String vh = evalMemoContentHash(vs);
+      if (vh == null) {
+        return null;
+      }
+      b.append(vh).append('\u0001');
+      // p is freshly merged on every call: hash its content, never its identity
+      String ph = evalMemoSha256(evalMemoCanonicalJson(p));
+      if (ph == null) {
+        return null;
+      }
+      b.append(ph).append('\u0001');
+      java.util.TreeSet<String> entries = new java.util.TreeSet<>();
+      if (!evalMemoAddValueSetEntries(entries, vs, 1)) {
+        return null;
+      }
+      for (String e : entries) {
+        b.append(e).append('\u0001');
+      }
+      b.append(noTerminologyServer).append('\u0001');
+      b.append(vs.getFHIRPublicationVersion()).append('\u0001');
+      b.append(getLocale());
+      return evalMemoSha256(b.toString());
+    } catch (Exception e) {
+      return null;
     }
   }
 
@@ -1969,12 +2341,25 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     String localWarning = null;
     
     if (options.isUseClient()) {
+      // run-scoped, content-keyed memo of the local evaluation (before any server fallthrough
+      // decision). This path hands the validator the caller's own CodeableConcept, which the
+      // validator mutates when a coding has no system, so the key builder refuses (returns null
+      // for) codeable concepts with system-less codings. See evalMemo notes.
+      String evalMemoKey = localValidationMemoKey("v-cc", "CodeableConcept", code, options, vs);
+      ValidationResult evalMemoHit = localValidationMemoGet(evalMemoKey);
+      if (evalMemoHit != null) {
+        if (cachingAllowed) {
+          txCache.cacheValidation(cacheToken, evalMemoHit, TerminologyCache.TRANSIENT);
+        }
+        return evalMemoHit;
+      }
       // ok, first we try to validate locally
       try {
         ValueSetValidator vsc = constructValueSetCheckerSimple(options, vs);
         vsc.setUnknownSystems(unknownSystems);
         vsc.setThrowToServer(options.isUseServer() && terminologyClientManager.hasClient());
         res = vsc.validateCode("CodeableConcept", code);
+        localValidationMemoPut(evalMemoKey, res);
         if (cachingAllowed) {
           txCache.cacheValidation(cacheToken, res, TerminologyCache.TRANSIENT);
         }

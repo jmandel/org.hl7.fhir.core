@@ -97,6 +97,30 @@ public class ValueSetExpansionOutcome {
     this.issues = issueList;
   }
   
+  /**
+   * A deep copy, for run-scoped memoization of local expansion outcomes (BaseWorkerContext): the stored
+   * and the returned outcomes must never alias, because callers mutate both the outcome's ValueSet and
+   * its error/issue lists. Note that ValueSet.copy() does not (by default) carry userData - e.g.
+   * UserDataNames.VS_EXPANSION_SOURCE - so callers that need userData must re-stamp it on the copy.
+   */
+  public ValueSetExpansionOutcome copy() {
+    ValueSetExpansionOutcome that = new ValueSetExpansionOutcome(valueset == null ? null : valueset.copy());
+    that.msgId = msgId;
+    that.code = code;
+    that.error = error;
+    that.errorClass = errorClass;
+    that.txLink = txLink;
+    that.allErrors = new ArrayList<>(allErrors);
+    that.fromServer = fromServer;
+    if (issues != null) {
+      that.issues = new ArrayList<>();
+      for (OperationOutcomeIssueComponent iss : issues) {
+        that.issues.add(iss.copy());
+      }
+    }
+    return that;
+  }
+
   public ValueSet getValueset() {
     return valueset;
   }
