@@ -337,6 +337,22 @@ public class TerminologyCache {
    *  .capabilityStatement.* / .terminologyCapabilities.* pages + servers.ini; never expires, never written back */
   private Map<String, CapabilityStatement> packCapabilityStatements = Collections.emptyMap();
   private Map<String, TerminologyCapabilities> packTerminologyCapabilities = Collections.emptyMap();
+  /**
+   * Read-only seed layer for externally resolved ValueSets/CodeSystems (the
+   * {@code BaseWorkerContext.findTxResource} / {@code doFindTxResource} flow): canonical url -> sourced
+   * resource, from the pack's {@code vs-externals.json} / {@code cs-externals.json} indexes plus their
+   * per-resource {@code vs-<uuid>.json} / {@code cs-<uuid>.json} files. A {@code null} value is a recorded
+   * NEGATIVE answer ("this canonical is not on the server") and matters as much as a positive one: it is
+   * what stops a pack-seeded run from re-asking the server for resources the recording run already learned
+   * it does not have. Consulted by {@link #hasValueSet}/{@link #getValueSet} (and the CS equivalents)
+   * BEFORE the mutable {@link #vsCache}/{@link #csCache}; never written back.
+   */
+  private Map<String, SourcedValueSet> packVsExternals = Collections.emptyMap();
+  private Map<String, SourcedCodeSystem> packCsExternals = Collections.emptyMap();
+  /** verbatim {@code system-map.json} text from the pack (the TerminologyClientManager resMap persistence
+   *  format); served to {@code TerminologyClientManager.setCache} so registry resolutions recorded by the
+   *  pack never trigger live tx-registry {@code /resolve} traffic. Null when the pack carries none. */
+  private String packSystemMapSource;
   @Getter private int packHitCount;
   private static final Object missLogLock = new Object();
   private static final String missLogPath = System.getProperty(LOG_MISSES_SYSTEM_PROPERTY);
@@ -1207,7 +1223,11 @@ public class TerminologyCache {
   private void loadPack(String packPath) throws IOException {
     Map<String, Map<String, CacheEntry>> pack = new HashMap<>();
     Map<String, String> capabilityTexts = new HashMap<>(); // page file name -> verbatim json text
+    Map<String, String> externalTexts = new HashMap<>();   // vs-<uuid>.json / cs-<uuid>.json -> verbatim json text
     String serversIni = null;
+    String vsExternalsSrc = null;
+    String csExternalsSrc = null;
+    String systemMapSrc = null;
     int n = 0;
     File pf = ManagedFileAccess.file(packPath);
     if (!pf.exists()) {
@@ -1219,6 +1239,14 @@ public class TerminologyCache {
           capabilityTexts.put(fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
         } else if (SERVERS_INI_FILE.equals(fn)) {
           serversIni = FileUtilities.fileToString(Utilities.path(packPath, fn));
+        } else if (VS_EXTERNALS_FILE.equals(fn)) {
+          vsExternalsSrc = FileUtilities.fileToString(Utilities.path(packPath, fn));
+        } else if (CS_EXTERNALS_FILE.equals(fn)) {
+          csExternalsSrc = FileUtilities.fileToString(Utilities.path(packPath, fn));
+        } else if (SYSTEM_MAP_FILE.equals(fn)) {
+          systemMapSrc = FileUtilities.fileToString(Utilities.path(packPath, fn));
+        } else if (isExternalResourceFile(fn)) {
+          externalTexts.put(fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
         } else if (fn.endsWith(CACHE_FILE_EXTENSION)) {
           n += loadPackPage(pack, fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
         }
@@ -1240,6 +1268,14 @@ public class TerminologyCache {
             capabilityTexts.put(fn, new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8));
           } else if (SERVERS_INI_FILE.equals(fn)) {
             serversIni = new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8);
+          } else if (VS_EXTERNALS_FILE.equals(fn)) {
+            vsExternalsSrc = new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8);
+          } else if (CS_EXTERNALS_FILE.equals(fn)) {
+            csExternalsSrc = new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8);
+          } else if (SYSTEM_MAP_FILE.equals(fn)) {
+            systemMapSrc = new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8);
+          } else if (isExternalResourceFile(fn)) {
+            externalTexts.put(fn, new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8));
           } else if (fn.endsWith(CACHE_FILE_EXTENSION)) {
             byte[] bytes = FileUtilities.streamToBytes(zf.getInputStream(ze));
             n += loadPackPage(pack, fn, new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
@@ -1253,12 +1289,97 @@ public class TerminologyCache {
     }
     packCaches = Collections.unmodifiableMap(immutable);
     loadPackCapabilities(packPath, capabilityTexts, serversIni);
+    loadPackExternals(packPath, vsExternalsSrc, csExternalsSrc, externalTexts);
+    packSystemMapSource = systemMapSrc;
     log.info("Loaded terminology pack "+packPath+": "+n+" entries across "+packCaches.size()+" systems"
         +(capabilityTexts.isEmpty() ? "" : ", "+packCapabilityStatements.size()+" capability statement(s) + "
-            +packTerminologyCapabilities.size()+" terminology capabilities for "+packServerAddressesForLog()));
+            +packTerminologyCapabilities.size()+" terminology capabilities for "+packServerAddressesForLog())
+        +(packVsExternals.isEmpty() && packCsExternals.isEmpty() ? "" : ", "+packVsExternals.size()+" VS / "
+            +packCsExternals.size()+" CS external resolutions")
+        +(systemMapSrc == null ? "" : ", system map present"));
   }
 
   static final String SERVERS_INI_FILE = "servers.ini";
+  static final String VS_EXTERNALS_FILE = "vs-externals.json";
+  static final String CS_EXTERNALS_FILE = "cs-externals.json";
+  static final String SYSTEM_MAP_FILE = "system-map.json";
+
+  /** a per-resource file referenced by the externals indexes (vs-<uuid>.json / cs-<uuid>.json) */
+  static boolean isExternalResourceFile(String fn) {
+    return (fn.startsWith("vs-") || fn.startsWith("cs-")) && fn.endsWith(".json")
+        && !VS_EXTERNALS_FILE.equals(fn) && !CS_EXTERNALS_FILE.equals(fn);
+  }
+
+  /**
+   * Loads the pack's external-resolution artifacts ({@code vs-externals.json} / {@code cs-externals.json}
+   * plus the per-resource files they reference) into the read-only external seed maps. Resources are
+   * parsed once here; lookups hand out defensive copies (the findTxResource flow sets web paths and user
+   * data on what it gets back, and pack state must stay immutable). Negative entries (json null) load as
+   * map entries with a null value. Like the other pack artifacts, anything unresolvable is a hard error:
+   * hermetic runs depend on the pack being complete and self-describing.
+   */
+  private void loadPackExternals(String packPath, String vsExternalsSrc, String csExternalsSrc, Map<String, String> externalTexts) throws IOException {
+    if (vsExternalsSrc == null && csExternalsSrc == null) {
+      return;
+    }
+    try {
+      if (vsExternalsSrc != null) {
+        Map<String, SourcedValueSet> vss = new HashMap<>();
+        org.hl7.fhir.utilities.json.model.JsonObject json = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(vsExternalsSrc);
+        for (JsonProperty p : json.getProperties()) {
+          if (p.getValue().isJsonNull()) {
+            vss.put(p.getName(), null);
+          } else {
+            org.hl7.fhir.utilities.json.model.JsonObject j = p.getValue().asJsonObject();
+            String fn = j.asString("filename");
+            String text = fn == null ? null : externalTexts.get(fn);
+            if (text == null) {
+              throw new IOException(VS_EXTERNALS_FILE+" entry '"+p.getName()+"' references missing pack file '"+fn+"'");
+            }
+            vss.put(p.getName(), new SourcedValueSet(j.asString("server"), (ValueSet) new JsonParser().parse(text)));
+          }
+        }
+        packVsExternals = Collections.unmodifiableMap(vss);
+      }
+      if (csExternalsSrc != null) {
+        Map<String, SourcedCodeSystem> css = new HashMap<>();
+        org.hl7.fhir.utilities.json.model.JsonObject json = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(csExternalsSrc);
+        for (JsonProperty p : json.getProperties()) {
+          if (p.getValue().isJsonNull()) {
+            css.put(p.getName(), null);
+          } else {
+            org.hl7.fhir.utilities.json.model.JsonObject j = p.getValue().asJsonObject();
+            String fn = j.asString("filename");
+            String text = fn == null ? null : externalTexts.get(fn);
+            if (text == null) {
+              throw new IOException(CS_EXTERNALS_FILE+" entry '"+p.getName()+"' references missing pack file '"+fn+"'");
+            }
+            css.put(p.getName(), new SourcedCodeSystem(j.asString("server"), (CodeSystem) new JsonParser().parse(text)));
+          }
+        }
+        packCsExternals = Collections.unmodifiableMap(css);
+      }
+    } catch (IOException e) {
+      throw new IOException("Terminology pack "+packPath+": "+e.getMessage(), e);
+    } catch (Exception e) {
+      throw new IOException("Terminology pack "+packPath+": error loading external resolutions: "+e.getMessage(), e);
+    }
+  }
+
+  /** verbatim system-map.json text the pack carries (TerminologyClientManager seeds its registry
+   *  resolution map from this, read-only), or null when the pack has none */
+  public String getPackSystemMapSource() {
+    return packSystemMapSource;
+  }
+
+  /** verification hooks for the external-resolution seed layer (negative entries included in the counts) */
+  public int getPackVsExternalsCount() {
+    return packVsExternals.size();
+  }
+
+  public int getPackCsExternalsCount() {
+    return packCsExternals.size();
+  }
 
   /**
    * Loads the pack's server capability artifacts (the {@code .capabilityStatement.<serverId>.cache} /
@@ -1422,7 +1543,7 @@ public class TerminologyCache {
       }
     }
     try {
-      File f = ManagedFileAccess.file(Utilities.path(folder, "vs-externals.json"));
+      File f = ManagedFileAccess.file(Utilities.path(folder, VS_EXTERNALS_FILE));
       if (f.exists()) {
         org.hl7.fhir.utilities.json.model.JsonObject json = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(f);
         for (JsonProperty p : json.getProperties()) {
@@ -1438,7 +1559,7 @@ public class TerminologyCache {
       log.error("Error loading vs external cache: "+e.getMessage(), e);
     }
     try {
-      File f = ManagedFileAccess.file(Utilities.path(folder, "cs-externals.json"));
+      File f = ManagedFileAccess.file(Utilities.path(folder, CS_EXTERNALS_FILE));
       if (f.exists()) {
         org.hl7.fhir.utilities.json.model.JsonObject json = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(f);
         for (JsonProperty p : json.getProperties()) {
@@ -1658,19 +1779,38 @@ public class TerminologyCache {
     return servers;
   }
 
+  // the external-resolution lookups consult the read-only pack seed layer BEFORE the mutable layer,
+  // exactly like the answer-page lookups do. A pack entry with a null value is a recorded negative
+  // answer: hasValueSet/hasCodeSystem returns true (so findTxResource does not re-ask the server) and
+  // getValueSet/getCodeSystem returns null (the same shape the mutable layer uses for negatives).
+
   public boolean hasValueSet(String canonical) {
+    if (packVsExternals.containsKey(canonical)) {
+      return true;
+    }
     synchronized (lock) {
       return vsCache.containsKey(canonical);
     }
   }
 
   public boolean hasCodeSystem(String canonical) {
+    if (packCsExternals.containsKey(canonical)) {
+      return true;
+    }
     synchronized (lock) {
       return csCache.containsKey(canonical);
     }
   }
 
   public SourcedValueSet getValueSet(String canonical) {
+    if (packVsExternals.containsKey(canonical)) {
+      SourcedValueSet svs = packVsExternals.get(canonical);
+      synchronized (lock) {
+        packHitCount++;
+      }
+      // defensive copy: callers set web paths / user data on the result, and pack state is immutable
+      return svs == null ? null : new SourcedValueSet(svs.getServer(), svs.getVs().copy());
+    }
     SourcedValueSetEntry sp;
     synchronized (lock) {
       sp = vsCache.get(canonical);
@@ -1687,6 +1827,13 @@ public class TerminologyCache {
   }
 
   public SourcedCodeSystem getCodeSystem(String canonical) {
+    if (packCsExternals.containsKey(canonical)) {
+      SourcedCodeSystem scs = packCsExternals.get(canonical);
+      synchronized (lock) {
+        packHitCount++;
+      }
+      return scs == null ? null : new SourcedCodeSystem(scs.getServer(), scs.getCs().copy());
+    }
     SourcedCodeSystemEntry sp;
     synchronized (lock) {
       sp = csCache.get(canonical);
@@ -1733,7 +1880,7 @@ public class TerminologyCache {
         }
       }
       if (folder != null) {
-        org.hl7.fhir.utilities.json.parser.JsonParser.compose(j, ManagedFileAccess.file(Utilities.path(folder, "vs-externals.json")), true);
+        org.hl7.fhir.utilities.json.parser.JsonParser.compose(j, ManagedFileAccess.file(Utilities.path(folder, VS_EXTERNALS_FILE)), true);
       }
     } catch (Exception e) {
       e.printStackTrace();
@@ -1772,7 +1919,7 @@ public class TerminologyCache {
         }
       }
       if (folder != null) {
-        org.hl7.fhir.utilities.json.parser.JsonParser.compose(j, ManagedFileAccess.file(Utilities.path(folder, "cs-externals.json")), true);
+        org.hl7.fhir.utilities.json.parser.JsonParser.compose(j, ManagedFileAccess.file(Utilities.path(folder, CS_EXTERNALS_FILE)), true);
       }
     } catch (Exception e) {
       e.printStackTrace();
@@ -1849,7 +1996,7 @@ public class TerminologyCache {
       }
       return "txCache report: "+
         c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount+
-        (packCaches.isEmpty() ? "" : ". Pack: "+getPackEntryCount()+" entries, "+packHitCount+" hits");
+        (packCaches.isEmpty() ? "" : ". Pack: "+getPackEntryCount()+" entries + "+packVsExternals.size()+" VS / "+packCsExternals.size()+" CS externals, "+packHitCount+" hits");
     }
   }
 }

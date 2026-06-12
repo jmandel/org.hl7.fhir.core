@@ -33,13 +33,22 @@ import com.google.gson.JsonObject;
  * {@link TerminologyCache} can load as a read-only seed layer via {@code -Dorg.hl7.fhir.tx.pack=...}:
  * <ul>
  *   <li>every entry whose response indicates a transport/transient failure (the poison classes:
- *       "Error from http", "Error performing tx", timeouts/connection failures) is filtered out.
+ *       timeouts/connection failures, and the "Error from http"/"Error performing tx" wrappers unless
+ *       they wrap a recognized DETERMINISTIC server refusal - grammar-based/unenumerable code systems,
+ *       too-costly expansions, expansions over code systems the server does not have) is filtered out.
  *       Poison entries are unrepresentable in a pack: the single writer through which entries reach
- *       a pack page refuses them (throws), so no code path can emit one;</li>
+ *       a pack page refuses them (throws), so no code path can emit one. Deterministic refusals are
+ *       kept: the server will refuse identically on every ask, so they are replayable answers;</li>
  *   <li>the cache dir's server capability artifacts ({@code .capabilityStatement.<serverId>.cache},
  *       {@code .terminologyCapabilities.<serverId>.cache}) and the {@code servers.ini} that maps the
  *       serverIds to addresses are copied into the pack, so the seed layer can serve client
  *       initialization (CapabilityStatement + TerminologyCapabilities) without any network access;</li>
+ *   <li>the cache dir's external-resolution artifacts - {@code vs-externals.json} /
+ *       {@code cs-externals.json} (canonical url -> resolved resource file, or null for the negative
+ *       "not on the server" answer) with their per-resource {@code vs-<uuid>.json} /
+ *       {@code cs-<uuid>.json} files, and {@code system-map.json} (the TerminologyClientManager's
+ *       tx-registry resolutions) - are copied into the pack, so findTxResource lookups (negatives
+ *       included) and registry resolutions are served without any network access;</li>
  *   <li>a manifest.json records entry counts per system, generation timestamp, the source server
  *       URL(s) and the effective terminology edition versions per system - both extracted from the
  *       captured responses themselves (validate-code responses carry "server" and "version"
@@ -85,9 +94,7 @@ public class TerminologyCachePackager {
    * phrase; an actual 503 reaches the cache wrapped as "Error from http .../Error performing tx",
    * which is already matched).
    */
-  private static final String[] POISON_MARKERS = {
-      "Error from http",
-      "Error performing tx",
+  private static final String[] TRANSPORT_MARKERS = {
       "SocketTimeoutException",
       "Read timed out",
       "connect timed out",
@@ -99,6 +106,33 @@ public class TerminologyCachePackager {
       "Failed to connect",
   };
 
+  /**
+   * The client-side HTTP failure wrappers. On their own these are poison - they wrap whatever went
+   * wrong on the wire - EXCEPT when the wrapped text is a recognized DETERMINISTIC SERVER REFUSAL
+   * (see {@link #DETERMINISTIC_REFUSAL_MARKERS}): an expansion the server will refuse the same way
+   * on every ask. Those refusals reach the cache as EFhirClientException messages wrapped in
+   * "Error from http...", so a pure wrapper-marker predicate would filter them out of every pack
+   * and leave permanent per-run $expand traffic (HTTP 422 + OperationOutcome each time).
+   */
+  private static final String[] HTTP_WRAPPER_MARKERS = {
+      "Error from http",
+      "Error performing tx",
+  };
+
+  /**
+   * Server-authored refusal texts that are deterministic for a fixed server + content edition (which
+   * the pack manifest pins): grammar-based code systems that can never be enumerated, expansions the
+   * server deems too costly at any time, and expansions of value sets over code systems the server
+   * does not have. An entry carrying one of these is a legitimate, replayable answer. The transport
+   * markers are checked FIRST and unconditionally, so a response that mentions a refusal but also
+   * carries a transport failure is still poison.
+   */
+  private static final String[] DETERMINISTIC_REFUSAL_MARKERS = {
+      "has a grammar, and cannot be enumerated",
+      "too costly to expand",
+      "could not be found, so the value set cannot be expanded",
+  };
+
   /** thrown if anything attempts to put a poison entry into a pack page */
   public static class PoisonEntryException extends IllegalArgumentException {
     PoisonEntryException(String message) {
@@ -107,7 +141,12 @@ public class TerminologyCachePackager {
   }
 
   public static boolean isPoison(String response) {
-    for (String marker : POISON_MARKERS) {
+    return poisonMarkerIn(response) != null;
+  }
+
+  /** a deterministic server refusal (see {@link #DETERMINISTIC_REFUSAL_MARKERS}) */
+  public static boolean isDeterministicRefusal(String response) {
+    for (String marker : DETERMINISTIC_REFUSAL_MARKERS) {
       if (response.contains(marker)) {
         return true;
       }
@@ -116,9 +155,14 @@ public class TerminologyCachePackager {
   }
 
   private static String poisonMarkerIn(String response) {
-    for (String marker : POISON_MARKERS) {
+    for (String marker : TRANSPORT_MARKERS) {
       if (response.contains(marker)) {
         return marker;
+      }
+    }
+    for (String marker : HTTP_WRAPPER_MARKERS) {
+      if (response.contains(marker)) {
+        return isDeterministicRefusal(response) ? null : marker;
       }
     }
     return null;
@@ -261,8 +305,10 @@ public class TerminologyCachePackager {
       }
       artifacts.put(TerminologyCache.SERVERS_INI_FILE, FileUtilities.fileToString(serversIni));
     }
+    ExternalArtifacts externals = collectExternalArtifacts(src);
     Map<String, String> packFiles = new TreeMap<>(pages);
     packFiles.putAll(artifacts);
+    packFiles.putAll(externals.files);
 
     String sha256 = sha256OfPages(packFiles);
 
@@ -304,6 +350,7 @@ public class TerminologyCachePackager {
       artifactArr.add(a);
     }
     manifest.add("capabilityArtifacts", artifactArr);
+    externals.addToManifest(manifest);
     manifest.addProperty("sha256", sha256);
 
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
@@ -322,6 +369,102 @@ public class TerminologyCachePackager {
     r.poisonFiltered = poison;
     r.manifest = manifest;
     return r;
+  }
+
+  /**
+   * The external-resolution artifacts a cache dir holds alongside its answer pages: the
+   * {@code vs-externals.json} / {@code cs-externals.json} indexes the {@code findTxResource} flow
+   * maintains (canonical url -> {server, filename} for resources fetched from the server by url,
+   * or json null for the NEGATIVE "not on the server" answer), the per-resource
+   * {@code vs-<uuid>.json} / {@code cs-<uuid>.json} files those indexes reference, and the
+   * {@code system-map.json} holding the TerminologyClientManager's registry resolutions. All are
+   * copied into the pack so the seed layer can answer findTxResource lookups (negatives included)
+   * and registry resolutions without any network access. An index entry referencing a file the
+   * cache dir does not have is a hard error: a pack must be self-contained.
+   */
+  private static final class ExternalArtifacts {
+    final Map<String, String> files = new TreeMap<>(); // pack file name -> content
+    int vsEntries, vsNegative, csEntries, csNegative, systemMapEntries;
+
+    void addToManifest(JsonObject manifest) {
+      JsonObject ext = new JsonObject();
+      ext.addProperty("valueSets", vsEntries);
+      ext.addProperty("valueSetsNegative", vsNegative);
+      ext.addProperty("codeSystems", csEntries);
+      ext.addProperty("codeSystemsNegative", csNegative);
+      ext.addProperty("systemMapEntries", systemMapEntries);
+      JsonArray names = new JsonArray();
+      for (String fn : files.keySet()) {
+        names.add(fn);
+      }
+      ext.add("files", names);
+      manifest.add("externalArtifacts", ext);
+    }
+  }
+
+  private static ExternalArtifacts collectExternalArtifacts(File src) throws IOException {
+    ExternalArtifacts res = new ExternalArtifacts();
+    int[] vsCounts = collectExternalsIndex(src, TerminologyCache.VS_EXTERNALS_FILE, res.files);
+    res.vsEntries = vsCounts[0];
+    res.vsNegative = vsCounts[1];
+    int[] csCounts = collectExternalsIndex(src, TerminologyCache.CS_EXTERNALS_FILE, res.files);
+    res.csEntries = csCounts[0];
+    res.csNegative = csCounts[1];
+    File systemMap = new File(src, TerminologyCache.SYSTEM_MAP_FILE);
+    if (systemMap.exists()) {
+      String text = FileUtilities.fileToString(systemMap);
+      res.files.put(TerminologyCache.SYSTEM_MAP_FILE, text);
+      res.systemMapEntries = countSystemMapEntries(TerminologyCache.SYSTEM_MAP_FILE, text);
+    }
+    return res;
+  }
+
+  /** copies one externals index verbatim plus every per-resource file it references; returns {entries, negative} */
+  private static int[] collectExternalsIndex(File src, String indexName, Map<String, String> into) throws IOException {
+    File index = new File(src, indexName);
+    if (!index.exists()) {
+      return new int[] { 0, 0 };
+    }
+    String text = FileUtilities.fileToString(index);
+    int entries = 0;
+    int negative = 0;
+    JsonObject json = parseJsonObject(indexName, text);
+    for (Map.Entry<String, com.google.gson.JsonElement> e : json.entrySet()) {
+      entries++;
+      if (e.getValue().isJsonNull()) {
+        negative++;
+        continue;
+      }
+      com.google.gson.JsonElement fnEl = e.getValue().getAsJsonObject().get("filename");
+      if (fnEl == null || fnEl.isJsonNull()) {
+        continue; // entry carries only a server; nothing to copy
+      }
+      String fn = fnEl.getAsString();
+      File rf = new File(src, fn);
+      if (!rf.exists()) {
+        throw new IOException(indexName+" entry '"+e.getKey()+"' references missing file '"+fn+"' in "+src);
+      }
+      String content = FileUtilities.fileToString(rf);
+      String prev = into.put(fn, content);
+      if (prev != null && !prev.equals(content)) {
+        throw new IOException("External resource file name collision with differing content: '"+fn+"'");
+      }
+    }
+    into.put(indexName, text);
+    return new int[] { entries, negative };
+  }
+
+  private static int countSystemMapEntries(String name, String text) throws IOException {
+    JsonObject json = parseJsonObject(name, text);
+    return json.has("systems") ? json.getAsJsonArray("systems").size() : 0;
+  }
+
+  private static JsonObject parseJsonObject(String name, String text) throws IOException {
+    try {
+      return (JsonObject) new com.google.gson.JsonParser().parse(text);
+    } catch (Exception e) {
+      throw new IOException("Malformed "+name+": "+e.getMessage(), e);
+    }
   }
 
   /**
@@ -374,6 +517,11 @@ public class TerminologyCachePackager {
     Map<String, Integer> perSourceKept = new LinkedHashMap<>();
     Map<String, String> artifacts = new TreeMap<>();        // capability pages; later source supersedes same name
     Map<String, String> mergedServerIds = new TreeMap<>();  // serverId -> address, union across sources
+    // external resolutions: canonical -> (index entry, source dir holding its file); later source wins
+    Map<String, Object[]> mergedVsExternals = new TreeMap<>();
+    Map<String, Object[]> mergedCsExternals = new TreeMap<>();
+    Map<String, JsonObject> mergedSystemMap = new TreeMap<>(); // system -> entry; later source wins
+    boolean anySystemMap = false;
     int entriesIn = 0;
     int poison = 0;
     int dupIdentical = 0;
@@ -382,6 +530,9 @@ public class TerminologyCachePackager {
     for (String dir : sourceCacheDirs) {
       int keptHere = 0;
       artifacts.putAll(collectCapabilityArtifacts(new File(dir)));
+      mergeExternalsIndex(new File(dir), TerminologyCache.VS_EXTERNALS_FILE, mergedVsExternals);
+      mergeExternalsIndex(new File(dir), TerminologyCache.CS_EXTERNALS_FILE, mergedCsExternals);
+      anySystemMap |= mergeSystemMap(new File(dir), mergedSystemMap);
       File serversIni = new File(dir, TerminologyCache.SERVERS_INI_FILE);
       if (serversIni.exists()) {
         for (Map.Entry<String, String> e : TerminologyCache.parseServersIni(FileUtilities.fileToString(serversIni)).entrySet()) {
@@ -450,8 +601,10 @@ public class TerminologyCachePackager {
       }
       artifacts.put(TerminologyCache.SERVERS_INI_FILE, ini.toString());
     }
+    ExternalArtifacts externals = emitMergedExternals(mergedVsExternals, mergedCsExternals, mergedSystemMap, anySystemMap);
     Map<String, String> packFiles = new TreeMap<>(pages);
     packFiles.putAll(artifacts);
+    packFiles.putAll(externals.files);
 
     String sha256 = sha256OfPages(packFiles);
 
@@ -511,6 +664,7 @@ public class TerminologyCachePackager {
       artifactArr.add(a);
     }
     manifest.add("capabilityArtifacts", artifactArr);
+    externals.addToManifest(manifest);
     manifest.addProperty("sha256", sha256);
 
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
@@ -531,6 +685,106 @@ public class TerminologyCachePackager {
     r.duplicatesSuperseded = dupSuperseded;
     r.manifest = manifest;
     return r;
+  }
+
+  /**
+   * Folds one source's externals index into the merged map (canonical -> {index entry, source dir}).
+   * Later sources supersede earlier ones per canonical - the newer resolution of the same canonical
+   * wins, exactly like answer-page entries. The source dir is kept alongside the entry so
+   * {@link #emitMergedExternals} copies the per-resource file from the dir whose entry won.
+   */
+  private static void mergeExternalsIndex(File src, String indexName, Map<String, Object[]> into) throws IOException {
+    File index = new File(src, indexName);
+    if (!index.exists()) {
+      return;
+    }
+    JsonObject json = parseJsonObject(indexName, FileUtilities.fileToString(index));
+    for (Map.Entry<String, com.google.gson.JsonElement> e : json.entrySet()) {
+      into.put(e.getKey(), new Object[] { e.getValue(), src });
+    }
+  }
+
+  /** folds one source's system-map.json into the merged map (system -> entry; later source wins); true if present */
+  private static boolean mergeSystemMap(File src, Map<String, JsonObject> into) throws IOException {
+    File f = new File(src, TerminologyCache.SYSTEM_MAP_FILE);
+    if (!f.exists()) {
+      return false;
+    }
+    JsonObject json = parseJsonObject(TerminologyCache.SYSTEM_MAP_FILE, FileUtilities.fileToString(f));
+    if (json.has("systems")) {
+      for (com.google.gson.JsonElement e : json.getAsJsonArray("systems")) {
+        JsonObject pair = e.getAsJsonObject();
+        if (pair.has("system")) {
+          into.put(pair.get("system").getAsString(), pair);
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Emits the merged external artifacts: regenerated indexes (sorted by canonical, so a merge is
+   * deterministic regardless of source order for equal content), the per-resource files copied from
+   * whichever source's entry won, and a regenerated system-map.json (sorted by system). The seed
+   * layer parses these as JSON, so the regenerated formatting is interchangeable with the verbatim
+   * copies {@code build} makes.
+   */
+  private static ExternalArtifacts emitMergedExternals(Map<String, Object[]> vsExternals, Map<String, Object[]> csExternals,
+      Map<String, JsonObject> systemMap, boolean anySystemMap) throws IOException {
+    ExternalArtifacts res = new ExternalArtifacts();
+    com.google.gson.Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    if (!vsExternals.isEmpty()) {
+      int[] counts = emitMergedExternalsIndex(TerminologyCache.VS_EXTERNALS_FILE, vsExternals, res.files, gson);
+      res.vsEntries = counts[0];
+      res.vsNegative = counts[1];
+    }
+    if (!csExternals.isEmpty()) {
+      int[] counts = emitMergedExternalsIndex(TerminologyCache.CS_EXTERNALS_FILE, csExternals, res.files, gson);
+      res.csEntries = counts[0];
+      res.csNegative = counts[1];
+    }
+    if (anySystemMap) {
+      JsonObject json = new JsonObject();
+      JsonArray arr = new JsonArray();
+      for (JsonObject pair : systemMap.values()) { // TreeMap: sorted by system
+        arr.add(pair);
+      }
+      json.add("systems", arr);
+      res.files.put(TerminologyCache.SYSTEM_MAP_FILE, gson.toJson(json));
+      res.systemMapEntries = systemMap.size();
+    }
+    return res;
+  }
+
+  private static int[] emitMergedExternalsIndex(String indexName, Map<String, Object[]> entries,
+      Map<String, String> into, com.google.gson.Gson gson) throws IOException {
+    JsonObject index = new JsonObject();
+    int negative = 0;
+    for (Map.Entry<String, Object[]> e : entries.entrySet()) { // TreeMap: sorted by canonical
+      com.google.gson.JsonElement entry = (com.google.gson.JsonElement) e.getValue()[0];
+      File src = (File) e.getValue()[1];
+      index.add(e.getKey(), entry);
+      if (entry.isJsonNull()) {
+        negative++;
+        continue;
+      }
+      com.google.gson.JsonElement fnEl = entry.getAsJsonObject().get("filename");
+      if (fnEl == null || fnEl.isJsonNull()) {
+        continue;
+      }
+      String fn = fnEl.getAsString();
+      File rf = new File(src, fn);
+      if (!rf.exists()) {
+        throw new IOException(indexName+" entry '"+e.getKey()+"' references missing file '"+fn+"' in "+src);
+      }
+      String content = FileUtilities.fileToString(rf);
+      String prev = into.put(fn, content);
+      if (prev != null && !prev.equals(content)) {
+        throw new IOException("Cannot merge: external resource file name collision with differing content: '"+fn+"'");
+      }
+    }
+    into.put(indexName, gson.toJson(index));
+    return new int[] { entries.size(), negative };
   }
 
   /** pulls server URL and effective system/version pairs out of a captured response */
@@ -606,6 +860,9 @@ public class TerminologyCachePackager {
           +(cache.getPackCapabilityStatement(address) != null)+", TerminologyCapabilities="
           +(cache.getTerminologyCapabilities(address) != null));
     }
+    System.out.println("  external resolutions: "+cache.getPackVsExternalsCount()+" ValueSet(s), "
+        +cache.getPackCsExternalsCount()+" CodeSystem(s) (negatives included); system map "
+        +(cache.getPackSystemMapSource() != null ? "present" : "absent"));
 
     // sample entries spread across pages, looked up via packContains (name + canonical request -> key)
     File pf = new File(packPath);
@@ -679,8 +936,10 @@ public class TerminologyCachePackager {
       System.out.println("     holds every server answer the run needed, including what client init fetches.");
       System.out.println("     Transport/transient failures are still never persisted; if the recording run had network");
       System.out.println("     trouble, its (poison-filtered) pack will simply be missing those answers - re-record.");
-      System.out.println("  2. TerminologyCachePackager build <thatCacheDir> <outDir>   (poison entries are filtered;");
-      System.out.println("     capability artifacts + servers.ini are copied into the pack)");
+      System.out.println("  2. TerminologyCachePackager build <thatCacheDir> <outDir>   (poison entries are filtered,");
+      System.out.println("     deterministic expansion refusals are kept; capability artifacts + servers.ini,");
+      System.out.println("     vs-externals.json/cs-externals.json + their resource files, and system-map.json");
+      System.out.println("     are copied into the pack)");
       System.out.println("  3. TerminologyCachePackager verify <outDir>/txpack-<sha256>");
       System.out.println("  4. consume with -Dorg.hl7.fhir.tx.pack=<packDir> [-Dorg.hl7.fhir.tx.hermetic=true]");
       System.out.println("  later top-ups: record a delta run seeded with the pack, then 'merge' the original cache");

@@ -152,6 +152,10 @@ public class TerminologyClientManager {
   private Map<String, TerminologyClientContext> serverMap = new HashMap<>(); // clients by server address
   private Map<String, Boolean> serverSupportMap = new HashMap<>(); // clients by server address
   private Map<String, ServerOptionList> resMap = new HashMap<>(); // client resolution list
+  /** read-only registry-resolution seed layer from an answer pack's system-map.json (see
+   *  TerminologyCache.getPackSystemMapSource): consulted before {@link #resMap}, never written back,
+   *  never persisted by {@link #save} */
+  private Map<String, ServerOptionList> packResMap = Collections.emptyMap();
   private List<InternalLogEvent> internalLog = Collections.synchronizedList(new ArrayList<>());
   protected Parameters expParameters;
 
@@ -185,6 +189,7 @@ public class TerminologyClientManager {
     serverList.addAll(other.serverList);
     serverMap.putAll(other.serverMap);
     resMap.putAll(other.resMap);
+    packResMap = other.packResMap;
     useEcosystem = other.useEcosystem;
     monitorServiceURL = other.monitorServiceURL;
     factory = other.factory;
@@ -405,6 +410,10 @@ public class TerminologyClientManager {
   }
 
   private ServerOptionList findServerForSystem(String s, boolean expand) throws TerminologyServiceException {
+    ServerOptionList packList = packResMap.get(s);
+    if (packList != null) {
+      return packList;
+    }
     ServerOptionList serverList = resMap.get(s);
     if (serverList == null) {
       serverList = decideWhichServer(s);
@@ -584,24 +593,54 @@ public class TerminologyClientManager {
     this.cache = cache;
     this.cacheFile = null;
 
+    if (cache != null && cache.getPackSystemMapSource() != null) {
+      // answer-pack seed layer for registry resolutions: consulted before resMap (see
+      // findServerForSystem) and never written back - save() persists only resMap, so pack
+      // resolutions never leak into the mutable system-map.json. Unlike the tolerant mutable load
+      // below, a pack system map that cannot be parsed is a hard error: hermetic runs depend on it
+      // suppressing tx-registry /resolve traffic.
+      try {
+        Map<String, ServerOptionList> m = new HashMap<>();
+        readSystemMap(JsonParser.parseObject(cache.getPackSystemMapSource()), m);
+        packResMap = Collections.unmodifiableMap(m);
+      } catch (Exception e) {
+        throw new org.hl7.fhir.exceptions.FHIRException("Error loading terminology pack system map: "+e.getMessage(), e);
+      }
+    }
+
     if (cache != null && cache.getFolder() != null) {
       try {
         cacheFile = ManagedFileAccess.file(Utilities.path(cache.getFolder(), "system-map.json"));
         if (cacheFile.exists()) {
-          JsonObject json = JsonParser.parseObject(cacheFile);
-          for (JsonObject pair : json.getJsonObjects("systems")) {
-            String url = pair.asString("url");
-            if (url != null) {
-              if (pair.has("server")) {
-                resMap.put(pair.asString("system"), new ServerOptionList(url, pair.asString("server")));
-              } else {
-                resMap.put(pair.asString("system"), new ServerOptionList(url, pair.getStrings("authoritative"), pair.getStrings("candidates")));
-              }
-            }
-          }
+          readSystemMap(JsonParser.parseObject(cacheFile), resMap);
         }
       } catch (Exception e) {
         e.printStackTrace();
+      }
+    }
+  }
+
+  /** verification hooks for the pack-provided registry-resolution seed layer */
+  public int getPackResolutionCount() {
+    return packResMap.size();
+  }
+
+  public boolean hasPackResolution(String system) {
+    return packResMap.containsKey(system);
+  }
+
+  /** parses the system-map.json persistence format ({"systems": [{system, url, authoritative[], candidates[]}...]},
+   *  with the legacy single-"server" variant) into a resolution map; shared by the mutable cache load and the
+   *  read-only pack seed load so the two layers can never disagree on the format */
+  private void readSystemMap(JsonObject json, Map<String, ServerOptionList> into) {
+    for (JsonObject pair : json.getJsonObjects("systems")) {
+      String url = pair.asString("url");
+      if (url != null) {
+        if (pair.has("server")) {
+          into.put(pair.asString("system"), new ServerOptionList(url, pair.asString("server")));
+        } else {
+          into.put(pair.asString("system"), new ServerOptionList(url, pair.getStrings("authoritative"), pair.getStrings("candidates")));
+        }
       }
     }
   }

@@ -213,6 +213,210 @@ class TerminologyCachePackagerTests {
   }
 
   @Test
+  void deterministicExpansionRefusalsAreNotPoison() {
+    // the three refusal classes the server answers identically on every ask, as captured from the
+    // live corpora: the EFhirClientException wrapper around an HTTP 422 + OperationOutcome
+    String grammar = "e: {\n  \"from-server\" : true,\n  \"error\" : \"Error from " + SERVER
+        + ": Error: The code System \\\"urn:ietf:bcp:47\\\" has a grammar, and cannot be enumerated directly\\r\\n\"\n}";
+    String notFound = "e: {\n  \"from-server\" : true,\n  \"error\" : \"Error from " + SERVER
+        + ": Error: A definition for CodeSystem 'urn:oid:1.2.36.1.2001.1005.17' could not be found, so the value set cannot be expanded\\r\\n\"\n}";
+    String tooCostly = "e: {\n  \"from-server\" : true,\n  \"error\" : \"Error from " + SERVER
+        + ": Error: The value set is too costly to expand\\r\\n\"\n}";
+    // the client-composed compound wrapper around the same refusal
+    String compound = "e: {\n  \"error\" : \"Unable to expand included value set 'http://x': Unable to expand imported value set: Error from "
+        + SERVER + ": Error: A definition for CodeSystem 'doi:x' could not be found, so the value set cannot be expanded\\r\\n\"\n}";
+    assertFalse(TerminologyCachePackager.isPoison(grammar), "grammar refusal must be pack-representable");
+    assertFalse(TerminologyCachePackager.isPoison(notFound), "unknown-codesystem expansion refusal must be pack-representable");
+    assertFalse(TerminologyCachePackager.isPoison(tooCostly), "too-costly refusal must be pack-representable");
+    assertFalse(TerminologyCachePackager.isPoison(compound), "compound include-refusal must be pack-representable");
+    assertTrue(TerminologyCachePackager.isDeterministicRefusal(grammar));
+
+    // an HTTP wrapper around anything else stays poison
+    assertTrue(TerminologyCachePackager.isPoison("e: {\"error\" : \"Error from " + SERVER + ": Internal Server Error\"}"));
+    // a refusal text accompanied by a transport failure stays poison: transport markers win
+    assertTrue(TerminologyCachePackager.isPoison("e: {\"error\" : \"Error from " + SERVER
+        + ": has a grammar, and cannot be enumerated directly; Read timed out\"}"));
+  }
+
+  @Test
+  void expansionRefusalRoundTripsThroughPack() throws IOException {
+    System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
+    String refusal = "Error from " + SERVER
+        + ": Error: The code System \"urn:ietf:bcp:47\" has a grammar, and cannot be enumerated directly\r\n";
+
+    // 1. a run persists the deterministic refusal (the expansion store path has no error-class gate)
+    Path recordDir = tempDir("txcache-refusal");
+    TerminologyCache recording = new TerminologyCache(new Object(), recordDir.toString());
+    TerminologyCache.CacheToken token = recording.generateExpandToken("http://hl7.org/fhir/ValueSet/all-languages",
+        org.hl7.fhir.r5.context.ExpansionOptions.cacheNoHeirarchy());
+    recording.cacheExpansion(token, new org.hl7.fhir.r5.terminologies.expansion.ValueSetExpansionOutcome(
+        refusal, TerminologyServiceErrorClass.UNKNOWN, true), TerminologyCache.PERMANENT);
+    assertEquals(1, cachePages(recordDir).size(), "expansion refusal must persist");
+
+    // 2. the packager keeps it (deterministic refusal, not poison)
+    Path packParent = tempDir("txpack-refusal-out");
+    TerminologyCachePackager.BuildResult build = TerminologyCachePackager.build(recordDir.toString(), packParent.toString());
+    assertEquals(1, build.entriesKept, "deterministic refusal must pass the poison filter");
+    assertEquals(0, build.poisonFiltered);
+
+    // 3. the pack seed layer answers the same expansion request without the network
+    System.setProperty(TerminologyCache.PACK_SYSTEM_PROPERTY, build.packPath);
+    TerminologyCache packSeeded = new TerminologyCache(new Object(), "n/a");
+    TerminologyCache.CacheToken token2 = packSeeded.generateExpandToken("http://hl7.org/fhir/ValueSet/all-languages",
+        org.hl7.fhir.r5.context.ExpansionOptions.cacheNoHeirarchy());
+    org.hl7.fhir.r5.terminologies.expansion.ValueSetExpansionOutcome loaded = packSeeded.getExpansion(token2);
+    assertNotNull(loaded, "pack must answer the recorded expansion refusal");
+    assertEquals(refusal.trim(), loaded.getError().trim());
+    assertTrue(loaded.isFromServer());
+    assertEquals(1, packSeeded.getPackHitCount());
+  }
+
+  /** writes a minimal externals + system-map corpus into a cache dir; returns the positive ValueSet */
+  private static ValueSet writeExternalsCorpus(Path cacheDir) throws IOException {
+    ValueSet vs = new ValueSet();
+    vs.setId("yesnodontknow");
+    vs.setUrl("http://hl7.org/fhir/ValueSet/yesnodontknow");
+    vs.setVersion("6.0.0");
+    JsonParser json = new JsonParser();
+    json.setOutputStyle(OutputStyle.PRETTY);
+    Files.write(cacheDir.resolve("vs-0001.json"), json.composeString(vs).getBytes(StandardCharsets.UTF_8));
+    Files.write(cacheDir.resolve("vs-externals.json"), ("{\n"
+        + "  \"http://hl7.org/fhir/ValueSet/yesnodontknow\" : {\n"
+        + "    \"server\" : \"" + SERVER + "\",\n"
+        + "    \"filename\" : \"vs-0001.json\"\n"
+        + "  },\n"
+        + "  \"http://example.org/fhir/not-on-server\" : null\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+    Files.write(cacheDir.resolve("cs-externals.json"), ("{\n"
+        + "  \"http://www.whocc.no/atc\" : null\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+    Files.write(cacheDir.resolve("system-map.json"), ("{\n"
+        + "  \"systems\" : [{\n"
+        + "    \"system\" : \"http://www.whocc.no/atc\",\n"
+        + "    \"url\" : \"http://www.whocc.no/atc\",\n"
+        + "    \"authoritative\" : [],\n"
+        + "    \"candidates\" : [\"" + SERVER + "\"]\n"
+        + "  }]\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+    return vs;
+  }
+
+  @Test
+  void externalsAndSystemMapFlowThroughPackToSeedLayer() throws IOException {
+    System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
+    Path cacheDir = tempDir("txcache-externals");
+    ValueSet vs = writeExternalsCorpus(cacheDir);
+
+    Path packParent = tempDir("txpack-externals-out");
+    TerminologyCachePackager.BuildResult build = TerminologyCachePackager.build(cacheDir.toString(), packParent.toString());
+    assertTrue(new File(build.packPath, "vs-externals.json").exists());
+    assertTrue(new File(build.packPath, "cs-externals.json").exists());
+    assertTrue(new File(build.packPath, "vs-0001.json").exists());
+    assertTrue(new File(build.packPath, "system-map.json").exists());
+    com.google.gson.JsonObject ext = build.manifest.getAsJsonObject("externalArtifacts");
+    assertEquals(2, ext.get("valueSets").getAsInt());
+    assertEquals(1, ext.get("valueSetsNegative").getAsInt());
+    assertEquals(1, ext.get("codeSystems").getAsInt());
+    assertEquals(1, ext.get("codeSystemsNegative").getAsInt());
+    assertEquals(1, ext.get("systemMapEntries").getAsInt());
+
+    System.setProperty(TerminologyCache.PACK_SYSTEM_PROPERTY, build.packPath);
+    TerminologyCache packSeeded = new TerminologyCache(new Object(), "n/a");
+    assertEquals(2, packSeeded.getPackVsExternalsCount());
+    assertEquals(1, packSeeded.getPackCsExternalsCount());
+
+    // positive entry: known, and served as a parsed resource (a fresh copy per ask)
+    assertTrue(packSeeded.hasValueSet("http://hl7.org/fhir/ValueSet/yesnodontknow"));
+    TerminologyCache.SourcedValueSet svs = packSeeded.getValueSet("http://hl7.org/fhir/ValueSet/yesnodontknow");
+    assertNotNull(svs);
+    assertEquals(SERVER, svs.getServer());
+    assertTrue(vs.equalsDeep(svs.getVs()), "pack-served ValueSet must round-trip");
+    TerminologyCache.SourcedValueSet svs2 = packSeeded.getValueSet("http://hl7.org/fhir/ValueSet/yesnodontknow");
+    assertTrue(svs.getVs() != svs2.getVs(), "each ask must get a defensive copy");
+
+    // negative entries: known ("don't re-ask the server") but resolve to null
+    assertTrue(packSeeded.hasValueSet("http://example.org/fhir/not-on-server"));
+    assertNull(packSeeded.getValueSet("http://example.org/fhir/not-on-server"));
+    assertTrue(packSeeded.hasCodeSystem("http://www.whocc.no/atc"),
+        "negative CS answer must be known so findTxResource does not re-ask");
+    assertNull(packSeeded.getCodeSystem("http://www.whocc.no/atc"));
+    // unknown canonicals stay unknown
+    assertFalse(packSeeded.hasValueSet("http://example.org/fhir/never-seen"));
+
+    // system map text is exposed for the TerminologyClientManager seed layer
+    assertNotNull(packSeeded.getPackSystemMapSource());
+    org.hl7.fhir.r5.terminologies.client.TerminologyClientManager manager =
+        new org.hl7.fhir.r5.terminologies.client.TerminologyClientManager(null, "test", null);
+    manager.setCache(packSeeded);
+    assertEquals(1, manager.getPackResolutionCount());
+    assertTrue(manager.hasPackResolution("http://www.whocc.no/atc"),
+        "pack resolution must be seeded so no /tx-reg/resolve call happens");
+  }
+
+  @Test
+  void buildRefusesDanglingExternalsReference() throws IOException {
+    System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
+    Path cacheDir = tempDir("txcache-dangling");
+    Files.write(cacheDir.resolve("vs-externals.json"), ("{\n"
+        + "  \"http://example.org/vs\" : { \"server\" : \"" + SERVER + "\", \"filename\" : \"vs-missing.json\" }\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+    Path packParent = tempDir("txpack-dangling-out");
+    IOException e = org.junit.jupiter.api.Assertions.assertThrows(IOException.class,
+        () -> TerminologyCachePackager.build(cacheDir.toString(), packParent.toString()));
+    assertTrue(e.getMessage().contains("vs-missing.json"), "must name the dangling reference: " + e.getMessage());
+  }
+
+  @Test
+  void mergeUnionsExternalsWithLaterSourceWinning() throws IOException {
+    System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
+    Path dirA = tempDir("txcache-ext-merge-a");
+    writeExternalsCorpus(dirA);
+
+    // source B: flips the negative VS answer to a positive one, and adds a new system-map entry
+    Path dirB = tempDir("txcache-ext-merge-b");
+    ValueSet vsB = new ValueSet();
+    vsB.setId("now-on-server");
+    vsB.setUrl("http://example.org/fhir/not-on-server");
+    JsonParser json = new JsonParser();
+    json.setOutputStyle(OutputStyle.PRETTY);
+    Files.write(dirB.resolve("vs-0002.json"), json.composeString(vsB).getBytes(StandardCharsets.UTF_8));
+    Files.write(dirB.resolve("vs-externals.json"), ("{\n"
+        + "  \"http://example.org/fhir/not-on-server\" : {\n"
+        + "    \"server\" : \"" + SERVER + "\",\n"
+        + "    \"filename\" : \"vs-0002.json\"\n"
+        + "  }\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+    Files.write(dirB.resolve("system-map.json"), ("{\n"
+        + "  \"systems\" : [{\n"
+        + "    \"system\" : \"http://example.org/other\",\n"
+        + "    \"url\" : \"http://example.org/other\",\n"
+        + "    \"authoritative\" : [],\n"
+        + "    \"candidates\" : []\n"
+        + "  }]\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+
+    Path packParent = tempDir("txpack-ext-merge-out");
+    TerminologyCachePackager.BuildResult merge = TerminologyCachePackager.merge(
+        Arrays.asList(dirA.toString(), dirB.toString()), packParent.toString());
+
+    System.setProperty(TerminologyCache.PACK_SYSTEM_PROPERTY, merge.packPath);
+    TerminologyCache packSeeded = new TerminologyCache(new Object(), "n/a");
+    // A's positive entry survives
+    assertNotNull(packSeeded.getValueSet("http://hl7.org/fhir/ValueSet/yesnodontknow"));
+    // B's later answer supersedes A's negative
+    TerminologyCache.SourcedValueSet flipped = packSeeded.getValueSet("http://example.org/fhir/not-on-server");
+    assertNotNull(flipped, "later source must supersede the earlier negative answer");
+    assertEquals("now-on-server", flipped.getVs().getIdBase());
+    // system maps are unioned
+    org.hl7.fhir.r5.terminologies.client.TerminologyClientManager manager =
+        new org.hl7.fhir.r5.terminologies.client.TerminologyClientManager(null, "test", null);
+    manager.setCache(packSeeded);
+    assertEquals(2, manager.getPackResolutionCount());
+    assertTrue(manager.hasPackResolution("http://www.whocc.no/atc"));
+    assertTrue(manager.hasPackResolution("http://example.org/other"));
+  }
+
+  @Test
   void capabilityArtifactsFlowThroughPackToSeedLayer() throws IOException {
     System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
     Path cacheDir = tempDir("txcache-caps");
