@@ -120,6 +120,41 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
     }
   }
 
+  /**
+   * Hermetic terminology mode: {@code -Dorg.hl7.fhir.tx.hermetic=true} makes every FHIR-server HTTP
+   * request through this accessor (the single choke point all terminology/FHIR client traffic flows
+   * through) fail immediately with a {@link TxHermeticViolationError} that lists the request, instead
+   * of touching the network. Used together with the terminology answer pack
+   * ({@code -Dorg.hl7.fhir.tx.pack}) to prove that a build is fully answerable offline.
+   */
+  private static final boolean HERMETIC = Boolean.parseBoolean(System.getProperty("org.hl7.fhir.tx.hermetic"));
+
+  /**
+   * Thrown for any FHIR-server HTTP request attempted while hermetic mode is active. Extends
+   * {@link Error} deliberately: terminology clients catch {@code Exception} and convert failures into
+   * cached "Error performing tx ..." results, which would both hide the violation and poison the
+   * mutable cache. An Error propagates and fails the run loudly at the first network attempt.
+   */
+  public static class TxHermeticViolationError extends Error {
+    public TxHermeticViolationError(String message) {
+      super(message);
+    }
+  }
+
+  private static String describeBlockedRequest(HTTPRequest r) {
+    StringBuilder b = new StringBuilder();
+    b.append("Hermetic terminology mode (-Dorg.hl7.fhir.tx.hermetic=true) is active, but a FHIR server HTTP request was attempted: ");
+    b.append(r.getMethod()).append(" ").append(r.getUrl());
+    if (r.getBody() != null) {
+      String body = new String(r.getBody(), java.nio.charset.StandardCharsets.UTF_8);
+      if (body.length() > 4096) {
+        body = body.substring(0, 4096) + "...(" + r.getBody().length + " bytes total)";
+      }
+      b.append("\nrequest body: ").append(body);
+    }
+    return b.toString();
+  }
+
   private static final int THROTTLE_RETRY_LIMIT = 4;
 
   private static final AdaptiveThrottle ADAPTIVE_THROTTLE = initAdaptiveThrottle();
@@ -201,6 +236,9 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
   }
 
   public HTTPResult httpCall(HTTPRequest httpRequest) throws IOException {
+    if (HERMETIC) {
+      throw new TxHermeticViolationError(describeBlockedRequest(httpRequest));
+    }
     if (ADAPTIVE_THROTTLE != null) {
       return httpCallAdaptive(httpRequest);
     }

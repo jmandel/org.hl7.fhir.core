@@ -154,10 +154,10 @@ public class TerminologyCache {
 
   public static final boolean TRANSIENT = false;
   public static final boolean PERMANENT = true;
-  private static final String NAME_FOR_NO_SYSTEM = "all-systems";
-  private static final String ENTRY_MARKER = "-------------------------------------------------------------------------------------";
-  private static final String BREAK = "####";
-  private static final String CACHE_FILE_EXTENSION = ".cache";
+  static final String NAME_FOR_NO_SYSTEM = "all-systems";
+  static final String ENTRY_MARKER = "-------------------------------------------------------------------------------------";
+  static final String BREAK = "####";
+  static final String CACHE_FILE_EXTENSION = ".cache";
   private static final String CAPABILITY_STATEMENT_TITLE = ".capabilityStatement";
   private static final String TERMINOLOGY_CAPABILITIES_TITLE = ".terminologyCapabilities";
   private static final String FIXED_CACHE_VERSION = "4"; // last change: change the way tx.fhir.org handles expansions
@@ -304,6 +304,27 @@ public class TerminologyCache {
   private Map<String, SourcedCodeSystemEntry> csCache = new HashMap<>();
   private Map<String, String> serverMap = new HashMap<>();
 
+  /**
+   * System property naming a terminology "answer pack" (a directory or zip of files in the
+   * TerminologyCache on-disk format, typically produced by {@link TerminologyCachePackager}).
+   * When set, the pack is loaded at construction into a separate, immutable, read-only seed
+   * layer that is consulted on every get* BEFORE the mutable cache. Pack entries are never
+   * written back to, and never persisted into, the mutable cache directory.
+   */
+  public static final String PACK_SYSTEM_PROPERTY = "org.hl7.fhir.tx.pack";
+  /**
+   * System property naming an ndjson file to which the canonical request JSON of every
+   * pack+cache miss (i.e. every terminology request that has to leave the cache layers and may
+   * go to the network) is appended, one JSON object per line (thread-safe append).
+   */
+  public static final String LOG_MISSES_SYSTEM_PROPERTY = "org.hl7.fhir.tx.logMisses";
+
+  /** read-only seed layer: cache name -> (key -> entry); immutable after construction, consulted before {@link #caches} */
+  private Map<String, Map<String, CacheEntry>> packCaches = Collections.emptyMap();
+  @Getter private int packHitCount;
+  private static final Object missLogLock = new Object();
+  private static final String missLogPath = System.getProperty(LOG_MISSES_SYSTEM_PROPERTY);
+
   @Getter @Setter private static boolean noCaching;
   @Getter @Setter private static boolean cacheErrors;
 
@@ -342,6 +363,11 @@ public class TerminologyCache {
       }
       checkVersion();
       load();
+    }
+
+    String packPath = System.getProperty(PACK_SYSTEM_PROPERTY);
+    if (packPath != null && !packPath.trim().isEmpty()) {
+      loadPack(packPath.trim());
     }
   }
 
@@ -730,11 +756,17 @@ public class TerminologyCache {
 
   public ValueSetExpansionOutcome getExpansion(CacheToken cacheToken) {
     synchronized (lock) {
+      CacheEntry p = packLookup(cacheToken);
+      if (p != null && p.e != null) {
+        packHitCount++;
+        return p.e;
+      }
       NamedCache nc = getNamedCache(cacheToken);
       CacheEntry e = nc.map.get(cacheToken.key);
-      if (e == null)
+      if (e == null) {
+        logMiss("expand", cacheToken);
         return null;
-      else
+      } else
         return e.e;
     }
   }
@@ -790,10 +822,17 @@ public class TerminologyCache {
     }
     synchronized (lock) {
       requestCount++;
+      CacheEntry p = packLookup(cacheToken);
+      if (p != null && p.v != null) {
+        hitCount++;
+        packHitCount++;
+        return new ValidationResult(p.v);
+      }
       NamedCache nc = getNamedCache(cacheToken);
       CacheEntry e = nc.map.get(cacheToken.key);
       if (e == null) {
         networkCount++;
+        logMiss("validate", cacheToken);
         return null;
       } else {
         hitCount++;
@@ -1057,6 +1096,29 @@ public class TerminologyCache {
     return ce;
   }
 
+  /**
+   * Parses one cache page (the on-disk .cache file format: entries separated by {@link #ENTRY_MARKER},
+   * request and response separated by {@link #BREAK}) into CacheEntry objects.
+   */
+  private List<CacheEntry> parseCachePage(String src) throws IOException {
+    List<CacheEntry> results = new ArrayList<>();
+    if (src.startsWith("?"))
+      src = src.substring(1);
+    int i = src.indexOf(ENTRY_MARKER);
+    while (i > -1) {
+      String s = src.substring(0, i);
+      src = src.substring(i + ENTRY_MARKER.length() + 1);
+      i = src.indexOf(ENTRY_MARKER);
+      if (!Utilities.noString(s)) {
+        int j = s.indexOf(BREAK);
+        String request = s.substring(0, j);
+        String p = s.substring(j + BREAK.length() + 1).trim();
+        results.add(getCacheEntry(request, p));
+      }
+    }
+    return results;
+  }
+
   private void loadNamedCache(String fn) throws IOException {
     int c = 0;
     try {
@@ -1065,29 +1127,126 @@ public class TerminologyCache {
 
       NamedCache nc = new NamedCache();
       nc.name = title;
+      caches.put(nc.name, nc);
 
-      if (src.startsWith("?"))
-        src = src.substring(1);
-      int i = src.indexOf(ENTRY_MARKER);
-      while (i > -1) {
+      for (CacheEntry cacheEntry : parseCachePage(src)) {
         c++;
-        String s = src.substring(0, i);
-        src = src.substring(i + ENTRY_MARKER.length() + 1);
-        i = src.indexOf(ENTRY_MARKER);
-        if (!Utilities.noString(s)) {
-          int j = s.indexOf(BREAK);
-          String request = s.substring(0, j);
-          String p = s.substring(j + BREAK.length() + 1).trim();
-
-          CacheEntry cacheEntry = getCacheEntry(request, p);
-
-          nc.map.put(String.valueOf(hashJson(cacheEntry.request)), cacheEntry);
-          nc.list.add(cacheEntry);
-        }
-        caches.put(nc.name, nc);
-      }        
+        nc.map.put(String.valueOf(hashJson(cacheEntry.request)), cacheEntry);
+        nc.list.add(cacheEntry);
+      }
     } catch (Exception e) {
       log.error("Error loading "+fn+": "+e.getMessage()+" entry "+c+" - ignoring it", e);
+    }
+  }
+
+  // ----- read-only pack seed layer ------------------------------------------------------------------
+
+  /**
+   * Loads a terminology answer pack (directory or zip of .cache pages, see {@link TerminologyCachePackager})
+   * into the immutable seed layer. Pack entries are consulted before the mutable cache on every get*,
+   * are never written back, and are never persisted to the mutable cache folder. Unlike the mutable
+   * cache (which tolerates corrupt pages by dropping them), a pack that cannot be read is a hard error:
+   * hermetic runs depend on its contents.
+   */
+  private void loadPack(String packPath) throws IOException {
+    Map<String, Map<String, CacheEntry>> pack = new HashMap<>();
+    int n = 0;
+    File pf = ManagedFileAccess.file(packPath);
+    if (!pf.exists()) {
+      throw new IOException("Terminology pack not found: "+packPath);
+    }
+    if (pf.isDirectory()) {
+      for (String fn : pf.list()) {
+        if (fn.endsWith(CACHE_FILE_EXTENSION) && !isCapabilityCache(fn)) {
+          n += loadPackPage(pack, fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
+        }
+      }
+    } else {
+      try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(pf)) {
+        java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zf.entries();
+        while (entries.hasMoreElements()) {
+          java.util.zip.ZipEntry ze = entries.nextElement();
+          String fn = ze.getName();
+          int slash = fn.lastIndexOf('/');
+          if (slash >= 0) {
+            fn = fn.substring(slash + 1);
+          }
+          if (!ze.isDirectory() && fn.endsWith(CACHE_FILE_EXTENSION) && !isCapabilityCache(fn)) {
+            byte[] bytes = FileUtilities.streamToBytes(zf.getInputStream(ze));
+            n += loadPackPage(pack, fn, new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+          }
+        }
+      }
+    }
+    Map<String, Map<String, CacheEntry>> immutable = new HashMap<>();
+    for (Map.Entry<String, Map<String, CacheEntry>> e : pack.entrySet()) {
+      immutable.put(e.getKey(), Collections.unmodifiableMap(e.getValue()));
+    }
+    packCaches = Collections.unmodifiableMap(immutable);
+    log.info("Loaded terminology pack "+packPath+": "+n+" entries across "+packCaches.size()+" systems");
+  }
+
+  private int loadPackPage(Map<String, Map<String, CacheEntry>> pack, String fn, String src) throws IOException {
+    String title = fn.substring(0, fn.lastIndexOf("."));
+    Map<String, CacheEntry> m = pack.computeIfAbsent(title, k -> new HashMap<>());
+    int n = 0;
+    try {
+      for (CacheEntry cacheEntry : parseCachePage(src)) {
+        m.put(String.valueOf(hashJson(cacheEntry.request)), cacheEntry);
+        n++;
+      }
+    } catch (Exception e) {
+      throw new IOException("Error loading terminology pack page "+fn+" (after "+n+" entries): "+e.getMessage(), e);
+    }
+    return n;
+  }
+
+  /** seed-layer lookup; must only be called under {@link #lock} (CacheEntry result objects are shared) */
+  private CacheEntry packLookup(CacheToken cacheToken) {
+    if (packCaches.isEmpty() || cacheToken.key == null) {
+      return null;
+    }
+    Map<String, CacheEntry> m = packCaches.get(cacheToken.name == null ? "null" : cacheToken.name);
+    return m == null ? null : m.get(cacheToken.key);
+  }
+
+  /** verification hook: total number of entries in the read-only pack seed layer */
+  public int getPackEntryCount() {
+    int n = 0;
+    for (Map<String, CacheEntry> m : packCaches.values()) {
+      n += m.size();
+    }
+    return n;
+  }
+
+  /** verification hook: true if the pack seed layer holds an entry for this canonical request under the given cache name */
+  public boolean packContains(String name, String request) {
+    Map<String, CacheEntry> m = packCaches.get(name == null ? "null" : name);
+    return m != null && m.containsKey(hashJson(request));
+  }
+
+  /**
+   * If {@link #LOG_MISSES_SYSTEM_PROPERTY} is set, appends one JSON line for this pack+cache miss
+   * (the canonical request JSON plus its cache name/key) to the miss log. Append is thread-safe
+   * (single JVM-wide lock + atomic append open); errors are logged, never thrown.
+   */
+  private static void logMiss(String op, CacheToken cacheToken) {
+    if (missLogPath == null || cacheToken.request == null) {
+      return;
+    }
+    try {
+      JsonObject o = new JsonObject();
+      o.addProperty("op", op);
+      o.addProperty("name", cacheToken.name == null ? "null" : cacheToken.name);
+      o.addProperty("key", cacheToken.key);
+      o.addProperty("request", cacheToken.request);
+      byte[] line = (o.toString()+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      synchronized (missLogLock) {
+        java.nio.file.Files.write(java.nio.file.Paths.get(missLogPath), line,
+            java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+      }
+    } catch (IOException e) {
+      log.error("Unable to append to terminology miss log "+missLogPath+": "+e.getMessage());
     }
   }
 
@@ -1427,10 +1586,17 @@ public class TerminologyCache {
    }
    synchronized (lock) {
      requestCount++;
+     CacheEntry p = packLookup(cacheToken);
+     if (p != null && p.s != null) {
+       hitCount++;
+       packHitCount++;
+       return p.s.result;
+     }
      NamedCache nc = getNamedCache(cacheToken);
      CacheEntry e = nc.map.get(cacheToken.key);
      if (e == null) {
        networkCount++;
+       logMiss("subsumes", cacheToken);
        return null;
      } else {
        hitCount++;
@@ -1461,7 +1627,8 @@ public class TerminologyCache {
         c += nc.list.size();
       }
       return "txCache report: "+
-        c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount;
+        c+" entries in "+caches.size()+" buckets + "+vsCache.size()+" VS, "+csCache.size()+" CS & "+serverMap.size()+" SM. Hitcount = "+hitCount+"/"+requestCount+", "+networkCount+
+        (packCaches.isEmpty() ? "" : ". Pack: "+getPackEntryCount()+" entries, "+packHitCount+" hits");
     }
   }
 }
