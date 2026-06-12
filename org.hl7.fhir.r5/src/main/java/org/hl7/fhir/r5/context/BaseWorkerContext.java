@@ -1690,6 +1690,13 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       // we had some problem evaluating locally, but the server doesn't know the code system, so we'll just go with the local error
       res = new ValidationResult(IssueSeverity.WARNING, localWarning, null);
       res.setDiagnostics("Local Warning: "+localWarning.trim()+". Server Error: "+res.getMessage());
+      // this answer is fully determined by localWarning (getMessage() above reads the rebuilt
+      // result, not the server's), so it is safe to cache: without this, the early return skips
+      // the store below and every repeat of this shape is a fresh server round trip - and a
+      // recording run can never make the shape packable (it is the narrative-path residual)
+      if (cachingAllowed && txCache != null) {
+        txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
+      }
       return res;
     }
     // this token's answer was obtained pre-arming (the memo suppression above did not intercept
