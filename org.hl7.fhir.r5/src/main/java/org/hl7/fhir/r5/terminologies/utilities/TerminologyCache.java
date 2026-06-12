@@ -318,15 +318,32 @@ public class TerminologyCache {
    * go to the network) is appended, one JSON object per line (thread-safe append).
    */
   public static final String LOG_MISSES_SYSTEM_PROPERTY = "org.hl7.fhir.tx.logMisses";
+  /**
+   * System property (true/false) for recording runs: when set, {@link #store} also persists
+   * SEMANTIC, DETERMINISTIC error answers - a server's definitive
+   * {@link TerminologyServiceErrorClass#CODESYSTEM_UNSUPPORTED} "I don't know this code system"
+   * answer for an unversioned request, which the default policy deliberately never writes to disk -
+   * so that packaging the resulting cache dir yields an answer pack that can serve those answers
+   * without the network. Transport/transient failures (the poison classes:
+   * "Error from http"/"Error performing tx"/timeout/connection) are NEVER persisted by this flag:
+   * the rescue clause re-checks the exact bytes the entry would persist against
+   * {@link TerminologyCachePackager#isPoison}.
+   */
+  public static final String RECORD_SEMANTIC_ERRORS_SYSTEM_PROPERTY = "org.hl7.fhir.tx.recordSemanticErrors";
 
   /** read-only seed layer: cache name -> (key -> entry); immutable after construction, consulted before {@link #caches} */
   private Map<String, Map<String, CacheEntry>> packCaches = Collections.emptyMap();
+  /** read-only seed layer for server capability artifacts: server address -> resource, from the pack's
+   *  .capabilityStatement.* / .terminologyCapabilities.* pages + servers.ini; never expires, never written back */
+  private Map<String, CapabilityStatement> packCapabilityStatements = Collections.emptyMap();
+  private Map<String, TerminologyCapabilities> packTerminologyCapabilities = Collections.emptyMap();
   @Getter private int packHitCount;
   private static final Object missLogLock = new Object();
   private static final String missLogPath = System.getProperty(LOG_MISSES_SYSTEM_PROPERTY);
 
   @Getter @Setter private static boolean noCaching;
   @Getter @Setter private static boolean cacheErrors;
+  @Getter @Setter private static boolean recordSemanticErrors = Boolean.getBoolean(RECORD_SEMANTIC_ERRORS_SYSTEM_PROPERTY);
 
   /**
    * @param lock unused as of the thread-safety rework: the cache is now self-synchronized on a private
@@ -436,11 +453,22 @@ public class TerminologyCache {
   }
   
   public boolean hasCapabilityStatement(String address) {
-    return capabilityStatementCache.containsKey(address);
+    return capabilityStatementCache.containsKey(address) || packCapabilityStatements.containsKey(address);
   }
 
   public CapabilityStatement getCapabilityStatement(String address) {
-    return capabilityStatementCache.get(address);
+    CapabilityStatement cs = capabilityStatementCache.get(address);
+    return cs != null ? cs : packCapabilityStatements.get(address);
+  }
+
+  /**
+   * Pack-only CapabilityStatement lookup. Client init ({@link org.hl7.fhir.r5.terminologies.client.TerminologyClientContext})
+   * deliberately does NOT reuse a CapabilityStatement from the mutable cache (it always wants to hear
+   * from the live server), but a pack-provided one is authoritative for hermetic runs, so this is the
+   * narrow accessor it uses to decide it can skip the network fetch entirely.
+   */
+  public CapabilityStatement getPackCapabilityStatement(String address) {
+    return packCapabilityStatements.get(address);
   }
 
   public void cacheCapabilityStatement(String address, CapabilityStatement capabilityStatement) throws IOException {
@@ -453,11 +481,12 @@ public class TerminologyCache {
 
 
   public boolean hasTerminologyCapabilities(String address) {
-    return terminologyCapabilitiesCache.containsKey(address);
+    return terminologyCapabilitiesCache.containsKey(address) || packTerminologyCapabilities.containsKey(address);
   }
 
   public TerminologyCapabilities getTerminologyCapabilities(String address) {
-    return terminologyCapabilitiesCache.get(address);
+    TerminologyCapabilities tc = terminologyCapabilitiesCache.get(address);
+    return tc != null ? tc : packTerminologyCapabilities.get(address);
   }
 
   public void cacheTerminologyCapabilities(String address, TerminologyCapabilities terminologyCapabilities) throws IOException {
@@ -790,7 +819,8 @@ public class TerminologyCache {
     if ( !cacheErrors &&
         ( e.v!= null
         && e.v.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED
-        && !cacheToken.hasVersion)) {
+        && !cacheToken.hasVersion)
+        && !(recordSemanticErrors && isRecordableSemanticError(e))) {
       return;
     }
 
@@ -813,6 +843,32 @@ public class TerminologyCache {
         // without re-serializing every existing entry on each store
         appendToCacheFile(nc, e);
       }
+    }
+  }
+
+  /**
+   * Recording-run rescue gate (see {@link #RECORD_SEMANTIC_ERRORS_SYSTEM_PROPERTY}): true only for a
+   * SEMANTIC, DETERMINISTIC error answer - the server's definitive CODESYSTEM_UNSUPPORTED /
+   * not-found-style answer - and never for a transport/transient failure. The class check alone is
+   * not trusted: the decision is made on the exact bytes this entry would persist (the same
+   * serialization {@link #writeEntry} emits), re-checked against the packager's poison predicate,
+   * so an entry the recording run persists can never be one the packager would have to filter.
+   */
+  private boolean isRecordableSemanticError(CacheEntry e) {
+    if (e.v == null || e.v.getErrorClass() != TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED) {
+      return false;
+    }
+    try {
+      java.io.StringWriter sw = new java.io.StringWriter();
+      JsonParser json = new JsonParser();
+      json.setOutputStyle(OutputStyle.PRETTY);
+      writeEntry(sw, json, e);
+      String text = sw.toString();
+      int i = text.indexOf(BREAK);
+      String response = i < 0 ? text : text.substring(i + BREAK.length());
+      return !TerminologyCachePackager.isPoison(response);
+    } catch (IOException ex) {
+      return false; // unserializable -> not recordable
     }
   }
 
@@ -1150,6 +1206,8 @@ public class TerminologyCache {
    */
   private void loadPack(String packPath) throws IOException {
     Map<String, Map<String, CacheEntry>> pack = new HashMap<>();
+    Map<String, String> capabilityTexts = new HashMap<>(); // page file name -> verbatim json text
+    String serversIni = null;
     int n = 0;
     File pf = ManagedFileAccess.file(packPath);
     if (!pf.exists()) {
@@ -1157,7 +1215,11 @@ public class TerminologyCache {
     }
     if (pf.isDirectory()) {
       for (String fn : pf.list()) {
-        if (fn.endsWith(CACHE_FILE_EXTENSION) && !isCapabilityCache(fn)) {
+        if (isCapabilityCache(fn) && fn.endsWith(CACHE_FILE_EXTENSION)) {
+          capabilityTexts.put(fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
+        } else if (SERVERS_INI_FILE.equals(fn)) {
+          serversIni = FileUtilities.fileToString(Utilities.path(packPath, fn));
+        } else if (fn.endsWith(CACHE_FILE_EXTENSION)) {
           n += loadPackPage(pack, fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
         }
       }
@@ -1166,12 +1228,19 @@ public class TerminologyCache {
         java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zf.entries();
         while (entries.hasMoreElements()) {
           java.util.zip.ZipEntry ze = entries.nextElement();
+          if (ze.isDirectory()) {
+            continue;
+          }
           String fn = ze.getName();
           int slash = fn.lastIndexOf('/');
           if (slash >= 0) {
             fn = fn.substring(slash + 1);
           }
-          if (!ze.isDirectory() && fn.endsWith(CACHE_FILE_EXTENSION) && !isCapabilityCache(fn)) {
+          if (isCapabilityCache(fn) && fn.endsWith(CACHE_FILE_EXTENSION)) {
+            capabilityTexts.put(fn, new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8));
+          } else if (SERVERS_INI_FILE.equals(fn)) {
+            serversIni = new String(FileUtilities.streamToBytes(zf.getInputStream(ze)), java.nio.charset.StandardCharsets.UTF_8);
+          } else if (fn.endsWith(CACHE_FILE_EXTENSION)) {
             byte[] bytes = FileUtilities.streamToBytes(zf.getInputStream(ze));
             n += loadPackPage(pack, fn, new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
           }
@@ -1183,7 +1252,88 @@ public class TerminologyCache {
       immutable.put(e.getKey(), Collections.unmodifiableMap(e.getValue()));
     }
     packCaches = Collections.unmodifiableMap(immutable);
-    log.info("Loaded terminology pack "+packPath+": "+n+" entries across "+packCaches.size()+" systems");
+    loadPackCapabilities(packPath, capabilityTexts, serversIni);
+    log.info("Loaded terminology pack "+packPath+": "+n+" entries across "+packCaches.size()+" systems"
+        +(capabilityTexts.isEmpty() ? "" : ", "+packCapabilityStatements.size()+" capability statement(s) + "
+            +packTerminologyCapabilities.size()+" terminology capabilities for "+packServerAddressesForLog()));
+  }
+
+  static final String SERVERS_INI_FILE = "servers.ini";
+
+  /**
+   * Loads the pack's server capability artifacts (the {@code .capabilityStatement.<serverId>.cache} /
+   * {@code .terminologyCapabilities.<serverId>.cache} pages the cache dir writes alongside the answer
+   * pages) into the read-only capability seed maps, resolving each page's serverId to its address
+   * through the pack's own servers.ini (never the mutable cache's serverMap: the pack must be
+   * self-describing). Like answer pages - and unlike the mutable capability cache, which expires after
+   * 24h - pack capabilities never expire and are never written back. A capability page that cannot be
+   * resolved or parsed is a hard error: hermetic client init depends on it.
+   */
+  private void loadPackCapabilities(String packPath, Map<String, String> capabilityTexts, String serversIni) throws IOException {
+    if (capabilityTexts.isEmpty()) {
+      return;
+    }
+    if (serversIni == null) {
+      throw new IOException("Terminology pack "+packPath+" has capability pages but no "+SERVERS_INI_FILE+" to resolve their server addresses");
+    }
+    Map<String, String> idToAddress = parseServersIni(serversIni);
+    Map<String, CapabilityStatement> cs = new HashMap<>();
+    Map<String, TerminologyCapabilities> tc = new HashMap<>();
+    for (Map.Entry<String, String> e : capabilityTexts.entrySet()) {
+      String fn = e.getKey();
+      String serverId = capabilityCacheServerId(fn);
+      String address = idToAddress.get(serverId);
+      if (address == null) {
+        throw new IOException("Terminology pack "+packPath+": capability page "+fn+" names server id '"+serverId+"' which is not in the pack's "+SERVERS_INI_FILE);
+      }
+      try {
+        Resource r = new JsonParser().parse((JsonObject) new com.google.gson.JsonParser().parse(e.getValue()));
+        if (fn.startsWith(CAPABILITY_STATEMENT_TITLE)) {
+          cs.put(address, (CapabilityStatement) r);
+        } else {
+          tc.put(address, (TerminologyCapabilities) r);
+        }
+      } catch (Exception ex) {
+        throw new IOException("Terminology pack "+packPath+": error parsing capability page "+fn+": "+ex.getMessage(), ex);
+      }
+    }
+    packCapabilityStatements = Collections.unmodifiableMap(cs);
+    packTerminologyCapabilities = Collections.unmodifiableMap(tc);
+  }
+
+  /** serverId from a capability page file name, exactly as {@link #loadCapabilityCache} derives it */
+  private static String capabilityCacheServerId(String fn) {
+    String serverId = fn.replace(CACHE_FILE_EXTENSION, "");
+    serverId = serverId.substring(serverId.indexOf(".")+1);
+    serverId = serverId.substring(serverId.indexOf(".")+1);
+    return serverId;
+  }
+
+  /** minimal parser for the [servers] section of a servers.ini (id = address per line) */
+  static Map<String, String> parseServersIni(String text) {
+    Map<String, String> idToAddress = new HashMap<>();
+    boolean inServers = false;
+    for (String line : text.split("\\r?\\n")) {
+      String t = line.trim();
+      if (t.startsWith("[")) {
+        inServers = t.equalsIgnoreCase("[servers]");
+      } else if (inServers && t.contains("=")) {
+        int i = t.indexOf('=');
+        idToAddress.put(t.substring(0, i).trim(), t.substring(i + 1).trim());
+      }
+    }
+    return idToAddress;
+  }
+
+  private String packServerAddressesForLog() {
+    return getPackCapabilityAddresses().toString();
+  }
+
+  /** verification hook: the server addresses for which the pack provides capability artifacts */
+  public Set<String> getPackCapabilityAddresses() {
+    Set<String> addresses = new TreeSet<>(packCapabilityStatements.keySet());
+    addresses.addAll(packTerminologyCapabilities.keySet());
+    return addresses;
   }
 
   private int loadPackPage(Map<String, Map<String, CacheEntry>> pack, String fn, String src) throws IOException {

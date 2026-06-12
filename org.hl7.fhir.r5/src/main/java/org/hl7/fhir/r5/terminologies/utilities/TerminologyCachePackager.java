@@ -36,12 +36,22 @@ import com.google.gson.JsonObject;
  *       "Error from http", "Error performing tx", timeouts/connection failures) is filtered out.
  *       Poison entries are unrepresentable in a pack: the single writer through which entries reach
  *       a pack page refuses them (throws), so no code path can emit one;</li>
+ *   <li>the cache dir's server capability artifacts ({@code .capabilityStatement.<serverId>.cache},
+ *       {@code .terminologyCapabilities.<serverId>.cache}) and the {@code servers.ini} that maps the
+ *       serverIds to addresses are copied into the pack, so the seed layer can serve client
+ *       initialization (CapabilityStatement + TerminologyCapabilities) without any network access;</li>
  *   <li>a manifest.json records entry counts per system, generation timestamp, the source server
  *       URL(s) and the effective terminology edition versions per system - both extracted from the
  *       captured responses themselves (validate-code responses carry "server" and "version"
  *       values) - and the sha256 of the pack content;</li>
  *   <li>the pack directory is named by that sha256 ({@code txpack-<sha256>}).</li>
  * </ul>
+ * To record a COMPLETE pack - one a hermetic run ({@code -Dorg.hl7.fhir.tx.hermetic=true}) can pass
+ * on - run the recording build cold with {@code -Dorg.hl7.fhir.tx.recordSemanticErrors=true}
+ * ({@link TerminologyCache#RECORD_SEMANTIC_ERRORS_SYSTEM_PROPERTY}), which additionally persists the
+ * server's deterministic CODESYSTEM_UNSUPPORTED answers (default cache policy drops them, leaving
+ * permanent per-run server traffic) while still refusing transport/transient failures. See the
+ * usage text of {@link #main} for the step-by-step recipe.
  * The {@code merge} mode builds one pack from MULTIPLE cache directories (e.g. the original cold-run
  * corpus plus the mutable-cache delta a later pack-seeded run had to fetch). Entries are deduplicated
  * by their canonical key ({@link TerminologyCache#cacheKeyFor}, i.e. the post-canonicalization key, so
@@ -63,6 +73,17 @@ public class TerminologyCachePackager {
   /**
    * Response substrings that mark an entry as poison (transport/transient failure captured from a
    * sick run). Pack files must never contain them.
+   * <p/>
+   * The predicate is deliberately restricted to TRANSPORT markers: the client-side HTTP failure
+   * wrappers ("Error from http", "Error performing tx") and the java.net timeout/connection failure
+   * texts. Semantic, deterministic error answers - above all the CODESYSTEM_UNSUPPORTED
+   * "I don't know this code system" answers that recording runs persist under
+   * {@code -Dorg.hl7.fhir.tx.recordSemanticErrors=true} - are legitimate pack content and must pass.
+   * Two earlier markers were dropped for being non-transport-specific: bare "timed out" (subsumed by
+   * the explicit "Read timed out"/"connect timed out" texts; bare, it would also match server-authored
+   * semantic messages that merely mention timing out) and "Service unavailable" (an HTTP status
+   * phrase; an actual 503 reaches the cache wrapped as "Error from http .../Error performing tx",
+   * which is already matched).
    */
   private static final String[] POISON_MARKERS = {
       "Error from http",
@@ -70,14 +91,12 @@ public class TerminologyCachePackager {
       "SocketTimeoutException",
       "Read timed out",
       "connect timed out",
-      "timed out",
       "Connection reset",
       "Connection refused",
       "UnknownHostException",
       "NoRouteToHostException",
       "ConnectException",
       "Failed to connect",
-      "Service unavailable",
   };
 
   /** thrown if anything attempts to put a poison entry into a pack page */
@@ -213,7 +232,7 @@ public class TerminologyCachePackager {
     java.util.Arrays.sort(names);
     for (String fn : names) {
       if (!fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) || fn.startsWith(".")) {
-        continue; // skip .capabilityStatement.* / .terminologyCapabilities.* and non-cache files
+        continue; // .capabilityStatement.* / .terminologyCapabilities.* are packaged separately below; other non-page files are skipped
       }
       String content = FileUtilities.fileToString(Utilities.path(sourceCacheDir, fn));
       PageParse page = parsePage(fn, content);
@@ -234,7 +253,18 @@ public class TerminologyCachePackager {
       }
     }
 
-    String sha256 = sha256OfPages(pages);
+    Map<String, String> artifacts = collectCapabilityArtifacts(src);
+    if (!artifacts.isEmpty()) {
+      File serversIni = new File(src, TerminologyCache.SERVERS_INI_FILE);
+      if (!serversIni.exists()) {
+        throw new IOException("Cache dir "+sourceCacheDir+" has capability pages but no "+TerminologyCache.SERVERS_INI_FILE+" to resolve their server addresses");
+      }
+      artifacts.put(TerminologyCache.SERVERS_INI_FILE, FileUtilities.fileToString(serversIni));
+    }
+    Map<String, String> packFiles = new TreeMap<>(pages);
+    packFiles.putAll(artifacts);
+
+    String sha256 = sha256OfPages(packFiles);
 
     JsonObject manifest = new JsonObject();
     manifest.addProperty("format", "fhir-tx-cache-pack/1");
@@ -269,11 +299,16 @@ public class TerminologyCachePackager {
       versions.add(e.getKey(), arr);
     }
     manifest.add("effectiveVersionsPerSystem", versions);
+    JsonArray artifactArr = new JsonArray();
+    for (String a : artifacts.keySet()) {
+      artifactArr.add(a);
+    }
+    manifest.add("capabilityArtifacts", artifactArr);
     manifest.addProperty("sha256", sha256);
 
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
     FileUtilities.createDirectory(packPath);
-    for (Map.Entry<String, String> e : pages.entrySet()) {
+    for (Map.Entry<String, String> e : packFiles.entrySet()) {
       Files.write(Paths.get(Utilities.path(packPath, e.getKey())), e.getValue().getBytes(StandardCharsets.UTF_8));
     }
     Files.write(Paths.get(Utilities.path(packPath, "manifest.json")),
@@ -287,6 +322,29 @@ public class TerminologyCachePackager {
     r.poisonFiltered = poison;
     r.manifest = manifest;
     return r;
+  }
+
+  /**
+   * The server capability artifacts a cache dir holds alongside its answer pages
+   * ({@code .capabilityStatement.<serverId>.cache} / {@code .terminologyCapabilities.<serverId>.cache}),
+   * copied verbatim so the pack seed layer ({@link TerminologyCache}) can serve client initialization
+   * (CapabilityStatement + TerminologyCapabilities) without any network access.
+   */
+  private static Map<String, String> collectCapabilityArtifacts(File src) throws IOException {
+    Map<String, String> artifacts = new TreeMap<>();
+    String[] names = src.list();
+    java.util.Arrays.sort(names);
+    for (String fn : names) {
+      if (isCapabilityArtifact(fn)) {
+        artifacts.put(fn, FileUtilities.fileToString(new File(src, fn)));
+      }
+    }
+    return artifacts;
+  }
+
+  private static boolean isCapabilityArtifact(String fn) {
+    return (fn.startsWith(".capabilityStatement.") || fn.startsWith(".terminologyCapabilities."))
+        && fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION);
   }
 
   /**
@@ -314,6 +372,8 @@ public class TerminologyCachePackager {
     TreeSet<String> servers = new TreeSet<>();
     Map<String, TreeSet<String>> effectiveVersions = new TreeMap<>();
     Map<String, Integer> perSourceKept = new LinkedHashMap<>();
+    Map<String, String> artifacts = new TreeMap<>();        // capability pages; later source supersedes same name
+    Map<String, String> mergedServerIds = new TreeMap<>();  // serverId -> address, union across sources
     int entriesIn = 0;
     int poison = 0;
     int dupIdentical = 0;
@@ -321,6 +381,17 @@ public class TerminologyCachePackager {
 
     for (String dir : sourceCacheDirs) {
       int keptHere = 0;
+      artifacts.putAll(collectCapabilityArtifacts(new File(dir)));
+      File serversIni = new File(dir, TerminologyCache.SERVERS_INI_FILE);
+      if (serversIni.exists()) {
+        for (Map.Entry<String, String> e : TerminologyCache.parseServersIni(FileUtilities.fileToString(serversIni)).entrySet()) {
+          String prev = mergedServerIds.put(e.getKey(), e.getValue());
+          if (prev != null && !prev.equals(e.getValue())) {
+            // the ids name the capability page files, so one id naming two servers is unresolvable
+            throw new IOException("Cannot merge: server id '"+e.getKey()+"' means "+prev+" in an earlier source but "+e.getValue()+" in "+dir);
+          }
+        }
+      }
       String[] names = new File(dir).list();
       java.util.Arrays.sort(names);
       for (String fn : names) {
@@ -369,7 +440,20 @@ public class TerminologyCachePackager {
       entryCounts.put(p.getKey().substring(0, p.getKey().length() - TerminologyCache.CACHE_FILE_EXTENSION.length()), w.getCount());
     }
 
-    String sha256 = sha256OfPages(pages);
+    if (!artifacts.isEmpty()) {
+      if (mergedServerIds.isEmpty()) {
+        throw new IOException("Cannot merge: sources have capability pages but no "+TerminologyCache.SERVERS_INI_FILE+" to resolve their server addresses");
+      }
+      StringBuilder ini = new StringBuilder("[servers]\r\n");
+      for (Map.Entry<String, String> e : mergedServerIds.entrySet()) {
+        ini.append(e.getKey()).append(" = ").append(e.getValue()).append("\r\n");
+      }
+      artifacts.put(TerminologyCache.SERVERS_INI_FILE, ini.toString());
+    }
+    Map<String, String> packFiles = new TreeMap<>(pages);
+    packFiles.putAll(artifacts);
+
+    String sha256 = sha256OfPages(packFiles);
 
     JsonObject manifest = new JsonObject();
     manifest.addProperty("format", "fhir-tx-cache-pack/1");
@@ -422,11 +506,16 @@ public class TerminologyCachePackager {
       versions.add(e.getKey(), arr);
     }
     manifest.add("effectiveVersionsPerSystem", versions);
+    JsonArray artifactArr = new JsonArray();
+    for (String a : artifacts.keySet()) {
+      artifactArr.add(a);
+    }
+    manifest.add("capabilityArtifacts", artifactArr);
     manifest.addProperty("sha256", sha256);
 
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
     FileUtilities.createDirectory(packPath);
-    for (Map.Entry<String, String> e : pages.entrySet()) {
+    for (Map.Entry<String, String> e : packFiles.entrySet()) {
       Files.write(Paths.get(Utilities.path(packPath, e.getKey())), e.getValue().getBytes(StandardCharsets.UTF_8));
     }
     Files.write(Paths.get(Utilities.path(packPath, "manifest.json")),
@@ -512,12 +601,17 @@ public class TerminologyCachePackager {
     System.setProperty(TerminologyCache.PACK_SYSTEM_PROPERTY, packPath);
     TerminologyCache cache = new TerminologyCache(new Object(), "n/a");
     System.out.println("Pack "+packPath+" loaded: "+cache.getPackEntryCount()+" entries");
+    for (String address : cache.getPackCapabilityAddresses()) {
+      System.out.println("  capabilities for "+address+": CapabilityStatement="
+          +(cache.getPackCapabilityStatement(address) != null)+", TerminologyCapabilities="
+          +(cache.getTerminologyCapabilities(address) != null));
+    }
 
     // sample entries spread across pages, looked up via packContains (name + canonical request -> key)
     File pf = new File(packPath);
     List<String> pageNames = new ArrayList<>();
     for (String fn : pf.list()) {
-      if (fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION)) {
+      if (fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) && !isCapabilityArtifact(fn)) {
         pageNames.add(fn);
       }
     }
@@ -575,6 +669,22 @@ public class TerminologyCachePackager {
       System.out.println("  TerminologyCachePackager build <sourceCacheDir> <outputParentDir>");
       System.out.println("  TerminologyCachePackager merge <sourceCacheDir1> <sourceCacheDir2> [...] <outputParentDir>");
       System.out.println("  TerminologyCachePackager verify <packDirOrZip> [sampleCount]");
+      System.out.println();
+      System.out.println("Recording a complete pack (one that also serves hermetic runs, -Dorg.hl7.fhir.tx.hermetic=true):");
+      System.out.println("  1. run the build/validation COLD (empty tx cache dir) with:");
+      System.out.println("       -Dorg.hl7.fhir.tx.recordSemanticErrors=true");
+      System.out.println("     this persists the server's deterministic CODESYSTEM_UNSUPPORTED (unknown/fictional code");
+      System.out.println("     system) answers that the default cache policy drops, and captures the server");
+      System.out.println("     CapabilityStatement alongside the TerminologyCapabilities + servers.ini, so the cache dir");
+      System.out.println("     holds every server answer the run needed, including what client init fetches.");
+      System.out.println("     Transport/transient failures are still never persisted; if the recording run had network");
+      System.out.println("     trouble, its (poison-filtered) pack will simply be missing those answers - re-record.");
+      System.out.println("  2. TerminologyCachePackager build <thatCacheDir> <outDir>   (poison entries are filtered;");
+      System.out.println("     capability artifacts + servers.ini are copied into the pack)");
+      System.out.println("  3. TerminologyCachePackager verify <outDir>/txpack-<sha256>");
+      System.out.println("  4. consume with -Dorg.hl7.fhir.tx.pack=<packDir> [-Dorg.hl7.fhir.tx.hermetic=true]");
+      System.out.println("  later top-ups: record a delta run seeded with the pack, then 'merge' the original cache");
+      System.out.println("  dir(s) + the delta cache dir into a consolidated pack.");
       System.exit(2);
     }
   }

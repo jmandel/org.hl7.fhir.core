@@ -191,8 +191,24 @@ public class TerminologyClientContext {
 
   private void initialize() throws IOException {
 
-      // we don't cache the quick CS - we want to know that the server is with us. 
-      capabilitiesStatement = client.getCapabilitiesStatement();
+      CapabilityStatement packCS = txCache == null ? null : txCache.getPackCapabilityStatement(getAddress());
+      if (packCS != null) {
+        // served from the read-only answer-pack seed layer (-Dorg.hl7.fhir.tx.pack=...): a pack-provided
+        // CapabilityStatement is authoritative for its pack, so client init needs no network (hermetic)
+        capabilitiesStatement = packCS;
+      } else {
+        // we don't REUSE a previously cached quick CS - we want to know that the server is with us -
+        // but we do capture it, so that a preserved cache dir packages into an answer pack that can
+        // serve client init offline (TerminologyCachePackager)
+        capabilitiesStatement = client.getCapabilitiesStatement();
+        if (txCache != null) {
+          try {
+            txCache.cacheCapabilityStatement(getAddress(), capabilitiesStatement);
+          } catch (IOException e) {
+            e.printStackTrace();
+          }
+        }
+      }
       checkFeature();
       if (txCache != null && txCache.hasTerminologyCapabilities(getAddress())) {
         txcaps = txCache.getTerminologyCapabilities(getAddress());
