@@ -44,16 +44,103 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
 
   private static int maxConcurrency() {
     final int defaultPermits = 4;
+    Integer configured = configuredMaxConcurrency();
+    return configured == null ? defaultPermits : configured;
+  }
+
+  /** the explicitly configured org.hl7.fhir.tx.maxConcurrency, or null when absent/unparseable/non-positive */
+  private static Integer configuredMaxConcurrency() {
     String value = System.getProperty("org.hl7.fhir.tx.maxConcurrency");
     if (value == null) {
-      return defaultPermits;
+      return null;
     }
     try {
       int parsed = Integer.parseInt(value.trim());
-      return parsed <= 0 ? defaultPermits : parsed;
+      return parsed <= 0 ? null : parsed;
     } catch (NumberFormatException e) {
-      return defaultPermits;
+      return null;
     }
+  }
+
+  /**
+   * Adaptive (AIMD-style) concurrency control for FHIR-server HTTP traffic.
+   * <p/>
+   * Starts at min(12, max). Any 404/429/503 response (public terminology servers shed load with
+   * these; tx.fhir.org's nginx notably answers 404 under overload) halves the permitted concurrency
+   * (floor 2) and the request is retried only after a backoff. Every 50 consecutive successful
+   * responses creep the permit count back up by 1, up to the max.
+   * <p/>
+   * Enabled by {@code org.hl7.fhir.tx.adaptiveConcurrency=true|false}; default is true when
+   * {@code org.hl7.fhir.tx.maxConcurrency} is not explicitly set, otherwise the explicit static
+   * value is honored (adaptive off) unless adaptiveConcurrency is explicitly true.
+   */
+  static class AdaptiveThrottle {
+    private final int maxPermits;
+    private int permits;
+    private int inFlight;
+    private int successStreak;
+
+    AdaptiveThrottle(int maxPermits) {
+      this.maxPermits = Math.max(2, maxPermits);
+      this.permits = Math.min(12, this.maxPermits);
+    }
+
+    synchronized void acquire() throws IOException {
+      while (inFlight >= permits) {
+        try {
+          wait(1000);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException("Interrupted while waiting to issue FHIR HTTP request", e);
+        }
+      }
+      inFlight++;
+    }
+
+    /** release a permit; throttled = response was a load-shedding status, success = a usable response */
+    synchronized void release(boolean throttled, boolean success) {
+      inFlight--;
+      if (throttled) {
+        permits = Math.max(2, permits / 2);
+        successStreak = 0;
+      } else if (success) {
+        successStreak++;
+        if (successStreak >= 50) {
+          successStreak = 0;
+          if (permits < maxPermits) {
+            permits++;
+          }
+        }
+      }
+      notifyAll();
+    }
+
+    synchronized int currentPermits() {
+      return permits;
+    }
+  }
+
+  private static final int THROTTLE_RETRY_LIMIT = 4;
+
+  private static final AdaptiveThrottle ADAPTIVE_THROTTLE = initAdaptiveThrottle();
+
+  private static AdaptiveThrottle initAdaptiveThrottle() {
+    Integer configuredMax = configuredMaxConcurrency();
+    String prop = System.getProperty("org.hl7.fhir.tx.adaptiveConcurrency");
+    boolean adaptive;
+    if (prop != null) {
+      adaptive = "true".equals(prop.trim());
+    } else {
+      adaptive = configuredMax == null;
+    }
+    if (!adaptive) {
+      return null;
+    }
+    return new AdaptiveThrottle(configuredMax == null ? 64 : configuredMax);
+  }
+
+  private static boolean isLoadSheddingStatus(int code) {
+    return code == 404 || code == 429 || code == 503;
   }
 
   private long timeout;
@@ -114,6 +201,9 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
   }
 
   public HTTPResult httpCall(HTTPRequest httpRequest) throws IOException {
+    if (ADAPTIVE_THROTTLE != null) {
+      return httpCallAdaptive(httpRequest);
+    }
     try {
       REQUEST_THROTTLE.acquire();
     } catch (InterruptedException e) {
@@ -121,6 +211,43 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
       throw new IOException("Interrupted while waiting to issue FHIR HTTP request to " + httpRequest.getUrl(), e);
     }
     try {
+      return httpCallInner(httpRequest);
+    } finally {
+      REQUEST_THROTTLE.release();
+    }
+  }
+
+  /**
+   * Adaptive path: acquire a permit, issue the request, and on a load-shedding response (404/429/503)
+   * halve the concurrency and retry this request only, after a backoff that grows with each attempt.
+   * The permit is released before backing off so other threads are not blocked by the sleeping request.
+   */
+  private HTTPResult httpCallAdaptive(HTTPRequest httpRequest) throws IOException {
+    int attempt = 0;
+    while (true) {
+      ADAPTIVE_THROTTLE.acquire();
+      HTTPResult result = null;
+      boolean throttled = false;
+      try {
+        result = httpCallInner(httpRequest);
+        throttled = isLoadSheddingStatus(result.getCode());
+      } finally {
+        ADAPTIVE_THROTTLE.release(throttled, result != null && !throttled);
+      }
+      if (!throttled || attempt >= THROTTLE_RETRY_LIMIT) {
+        return result;
+      }
+      attempt++;
+      try {
+        Thread.sleep(Math.min(250L * (1L << attempt), 5000L));
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return result;
+      }
+    }
+  }
+
+  private HTTPResult httpCallInner(HTTPRequest httpRequest) throws IOException {
       switch (ManagedWebAccess.getAccessPolicy()) {
         case DIRECT: {
           HTTPRequest requestWithAuthorizationHeaders = requestWithAuthorizationHeaders(httpRequest);
@@ -151,9 +278,6 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
         default:
           throw new IOException("Internal Error");
       }
-    } finally {
-      REQUEST_THROTTLE.release();
-    }
   }
 
   private HTTPResult getHTTPResult(Response execute) throws IOException {

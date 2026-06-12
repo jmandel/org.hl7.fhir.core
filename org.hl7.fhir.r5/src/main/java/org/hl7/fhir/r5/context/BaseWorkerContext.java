@@ -108,8 +108,10 @@ import org.hl7.fhir.utilities.*;
 import org.hl7.fhir.utilities.filesystem.ManagedFileAccess;
 import org.hl7.fhir.utilities.i18n.I18nBase;
 import org.hl7.fhir.utilities.i18n.I18nConstants;
+import org.hl7.fhir.utilities.i18n.subtag.LanguageSubtag;
 import org.hl7.fhir.utilities.i18n.subtag.LanguageSubtagRegistry;
 import org.hl7.fhir.utilities.i18n.subtag.LanguageSubtagRegistryLoader;
+import org.hl7.fhir.utilities.i18n.subtag.RegionSubtag;
 import org.hl7.fhir.utilities.npm.NpmPackage;
 import org.hl7.fhir.utilities.validation.ValidationMessage.IssueSeverity;
 import org.hl7.fhir.utilities.validation.ValidationMessage.IssueType;
@@ -268,6 +270,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   private CanonicalResourceManager<CodeSystem> codeSystems = new CanonicalResourceManager<CodeSystem>(false, minimalMemory);
   private final HashMap<String, SystemSupportInformation> supportedCodeSystems = new HashMap<>();
   private final Set<String> unsupportedCodeSystems = Collections.synchronizedSet(new HashSet<String>()); // know that the terminology server doesn't support them; written/read from concurrent validator threads
+  // Systems for which a real server round-trip returned the canonical "unknown code system" shape
+  // (verified field-by-field against the synthesis template in maybeRecordServerUnknownSystem).
+  // Subsequent vs-bound Coding validations for these systems are answered locally with a result
+  // that is byte-identical to what the server would have returned (see synthesizeUnknownSystemResult).
+  private final Set<String> serverConfirmedUnknownSystems = Collections.synchronizedSet(new HashSet<String>());
   private CanonicalResourceManager<ValueSet> valueSets = new CanonicalResourceManager<ValueSet>(false, minimalMemory);
   private CanonicalResourceManager<ConceptMap> maps = new CanonicalResourceManager<ConceptMap>(false, minimalMemory);
   protected CanonicalResourceManager<StructureMap> transforms = new CanonicalResourceManager<StructureMap>(false, minimalMemory);
@@ -1434,6 +1441,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return res;
     }
 
+    // local-first answering for grammar-based code systems (UCUM / BCP-47 / BCP-13), restricted to
+    // request shapes where the locally synthesized answer is provably identical to the server's
+    res = validateGrammarSystemLocally(options, code, vs);
+    if (res != null) {
+      if (txCache != null && cachingAllowed) {
+        txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
+      }
+      return res;
+    }
+
     List<OperationOutcomeIssueComponent> issues = new ArrayList<>();
     Set<String> unknownSystems = new HashSet<>();
     
@@ -1524,20 +1541,26 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.ERROR_VALIDATING_CODE_RUNNING_WITHOUT_TERMINOLOGY_SERVICES, code.getCode(), code.getSystem()), TerminologyServiceErrorClass.NOSERVICE, issues);
     }
 
-    Set<String> systems = findRelevantSystems(code, vs);
-    TerminologyClientContext tc = terminologyClientManager.chooseServer(vs, systems, false);
-    
-    String csumm = cachingAllowed && txCache != null ? txCache.summary(code) : null;
-    if (cachingAllowed && txCache != null) {
-      txLog("$validate "+csumm+(vs == null ? "" : " for "+ txCache.summary(vs))+" on "+tc.getAddress());
+    ValidationResult synthesized = synthesizeUnknownSystemResult(options, code, vs, localError);
+    if (synthesized != null) {
+      res = synthesized;
     } else {
-      txLog("$validate "+csumm+" before cache exists on "+tc.getAddress());
-    }
-    try {
-      Parameters pIn = constructParameters(options, code);
-      res = validateOnServer2(tc, vs, pIn, options, systems);
-    } catch (Exception e) {
-      res = new ValidationResult(IssueSeverity.ERROR, e.getMessage() == null ? e.getClass().getName() : e.getMessage(), null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(TerminologyServiceErrorClass.SERVER_ERROR);
+      Set<String> systems = findRelevantSystems(code, vs);
+      TerminologyClientContext tc = terminologyClientManager.chooseServer(vs, systems, false);
+
+      String csumm = cachingAllowed && txCache != null ? txCache.summary(code) : null;
+      if (cachingAllowed && txCache != null) {
+        txLog("$validate "+csumm+(vs == null ? "" : " for "+ txCache.summary(vs))+" on "+tc.getAddress());
+      } else {
+        txLog("$validate "+csumm+" before cache exists on "+tc.getAddress());
+      }
+      try {
+        Parameters pIn = constructParameters(options, code);
+        res = validateOnServer2(tc, vs, pIn, options, systems);
+      } catch (Exception e) {
+        res = new ValidationResult(IssueSeverity.ERROR, e.getMessage() == null ? e.getClass().getName() : e.getMessage(), null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(TerminologyServiceErrorClass.SERVER_ERROR);
+      }
+      maybeRecordServerUnknownSystem(options, code, vs, res, localError);
     }
     if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && (localError != null && !localError.equals(ValueSetValidator.NO_TRY_THE_SERVER))) {
       res = new ValidationResult(IssueSeverity.ERROR, localError, null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(type);
@@ -1693,6 +1716,219 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && !code.hasVersion() && fetchCodeSystem(codeKey, ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) == null) {
       unsupportedCodeSystems.add(codeKey);
     }
+  }
+
+  // ---- local-first, parity-safe terminology answering ------------------------------------------
+  // These short-circuits only fire for request shapes where the locally synthesized ValidationResult
+  // has been verified (field-by-field, against server responses captured in the terminology cache of
+  // a full spec build) to be identical to what the server would return. Anything outside the verified
+  // shape goes to the server exactly as before.
+
+  private static final boolean LOCAL_FIRST_TX = !"false".equals(System.getProperty("org.hl7.fhir.tx.localFirst"));
+
+  private static final String UCUM_SYSTEM = "http://unitsofmeasure.org";
+  private static final String MIMETYPES_SYSTEM = "urn:ietf:bcp:13";
+  private static final String LANG_SYSTEM = "urn:ietf:bcp:47";
+
+  // type/subtype only - no parameters, no whitespace. Conservative: anything that doesn't match goes
+  // to the server (which is grammar-based for bcp-13 and accepts unregistered subtypes like text/cql)
+  private static final java.util.regex.Pattern MIME_TYPE_GRAMMAR = java.util.regex.Pattern.compile("[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*");
+  // lowercase language subtag with optional alpha-2 uppercase region: the only shapes whose display
+  // synthesis ("Language (Region)") has been verified against the server's answers
+  private static final java.util.regex.Pattern LANG_TAG_SHAPE = java.util.regex.Pattern.compile("[a-z]{2,3}(-[A-Z]{2})?");
+
+  private String masterServerAddress() {
+    if (terminologyClientManager != null && terminologyClientManager.hasClient() && terminologyClientManager.getMasterClient() != null) {
+      return terminologyClientManager.getMasterClient().getAddress();
+    }
+    return null;
+  }
+
+  private boolean serverReachableForValidation(ValidationOptions options) {
+    return options.isUseServer() && !noTerminologyServer && terminologyClientManager.hasClient() && masterServerAddress() != null;
+  }
+
+  /**
+   * Local-first answering for grammar-based code systems (UCUM, BCP-13 mime types, BCP-47 language
+   * tags) on simple Coding validations with no value set. Returns null (= ask the server) unless the
+   * locally computed answer is provably identical to the server's:
+   * - only positive (ok, message-less) answers are synthesized; invalid codes go to the server so
+   *   the published error/warning text remains the server's
+   * - a display is only accepted when it is exactly the display the server would echo (UCUM/mime:
+   *   the code itself; lang: "Language (Region)" from the shared IANA subtag registry); any other
+   *   display goes to the server, which is the only display oracle (e.g. UCUM curated display names)
+   */
+  private ValidationResult validateGrammarSystemLocally(ValidationOptions options, Coding code, ValueSet vs) {
+    if (!LOCAL_FIRST_TX || vs != null || options == null || options.isGuessSystem() || !serverReachableForValidation(options)) {
+      return null;
+    }
+    if (!code.hasSystem() || !code.hasCode() || code.hasVersion()) {
+      return null;
+    }
+    String system = code.getSystem();
+    String c = code.getCode();
+    String display = code.hasDisplay() ? code.getDisplay() : null;
+    try {
+      if (UCUM_SYSTEM.equals(system)) {
+        UcumService ucum = getUcumService();
+        if (ucum == null || (display != null && !display.equals(c)) || ucum.validate(c) != null) {
+          return null;
+        }
+        String ucumVersion = ucum.ucumIdentification() != null ? ucum.ucumIdentification().getVersion() : null;
+        return okGrammarResult(system, ucumVersion, c, c);
+      } else if (MIMETYPES_SYSTEM.equals(system)) {
+        if ((display != null && !display.equals(c)) || !MIME_TYPE_GRAMMAR.matcher(c).matches()) {
+          return null;
+        }
+        return okGrammarResult(system, null, c, c);
+      } else if (LANG_SYSTEM.equals(system)) {
+        String d = bcp47Display(c);
+        if (d == null || (display != null && !display.equals(d))) {
+          return null;
+        }
+        return okGrammarResult(system, null, c, d);
+      }
+    } catch (Exception e) {
+      // anything unexpected: fall through to the server
+    }
+    return null;
+  }
+
+  private String bcp47Display(String code) {
+    if (registry == null || !LANG_TAG_SHAPE.matcher(code).matches()) {
+      return null;
+    }
+    int dash = code.indexOf("-");
+    String lang = dash < 0 ? code : code.substring(0, dash);
+    LanguageSubtag l = registry.hasLanguage(lang) ? registry.getLanguage(lang) : null;
+    if (l == null || l.getDisplay() == null) {
+      return null;
+    }
+    if (dash < 0) {
+      return l.getDisplay();
+    }
+    String region = code.substring(dash+1);
+    RegionSubtag r = registry.hasRegion(region) ? registry.getRegion(region) : null;
+    if (r == null || r.getDisplay() == null) {
+      return null;
+    }
+    return l.getDisplay()+" ("+r.getDisplay()+")";
+  }
+
+  // mirrors the fields processValidationResult produces for a positive, message-less server response
+  private ValidationResult okGrammarResult(String system, String version, String code, String display) {
+    ValidationResult res = new ValidationResult(system, version, new ConceptDefinitionComponent().setDisplay(display).setCode(code), display);
+    res.setIssues(new ArrayList<OperationOutcomeIssueComponent>());
+    res.setStatus(false, null);
+    res.setUnknownSystems(new HashSet<String>());
+    res.setServer(masterServerAddress());
+    return res;
+  }
+
+  /**
+   * The request shapes for which the server's "unknown code system" answer has a fully parameterized
+   * canonical form: a vs-bound validation of a bare Coding (no display, no version, no inferSystem,
+   * default membership/display modes) where the local attempt already failed (localError != null, so
+   * the final diagnostics string is deterministic and identical in both flows).
+   */
+  private boolean unknownSynthGate(ValidationOptions options, Coding code, ValueSet vs, String localError) {
+    return LOCAL_FIRST_TX && options != null && options.isUseClient() && !options.isGuessSystem()
+        && !options.isMembershipOnly() && !options.isDisplayWarningMode() && !options.isExampleOK()
+        && localError != null
+        && vs != null && vs.hasUrl() && vs.hasVersion()
+        && code.hasSystem() && code.hasCode() && !code.hasVersion() && !code.hasDisplay()
+        && serverReachableForValidation(options);
+  }
+
+  private String unknownSystemMessage(Coding code, ValueSet vs) {
+    return formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem())
+        + "; "
+        + formatMessage(I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, null, vs.getVersionedUrl(), "'"+code.getSystem()+"#"+code.getCode()+"'");
+  }
+
+  private List<OperationOutcomeIssueComponent> unknownSystemIssues(Coding code, ValueSet vs, String server) {
+    List<OperationOutcomeIssueComponent> issues = new ArrayList<>();
+    issues.add(unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType.NOTFOUND, "not-found",
+        formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem()), I18nConstants.UNKNOWN_CODESYSTEM, "Coding.system", server));
+    issues.add(unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType.CODEINVALID, "not-in-vs",
+        formatMessage(I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, null, vs.getVersionedUrl(), "'"+code.getSystem()+"#"+code.getCode()+"'"),
+        I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, "Coding.code", server));
+    return issues;
+  }
+
+  private OperationOutcomeIssueComponent unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType type, String txIssueType, String text, String msgId, String expression, String server) {
+    OperationOutcomeIssueComponent iss = new OperationOutcomeIssueComponent(org.hl7.fhir.r5.model.OperationOutcome.IssueSeverity.ERROR, type);
+    iss.addExtension(ExtensionDefinitions.EXT_ISSUE_MSG_ID, new StringType(msgId));
+    iss.addExtension(ExtensionDefinitions.EXT_ISSUE_SERVER, new UrlType(server));
+    iss.getDetails().addCoding("http://hl7.org/fhir/tools/CodeSystem/tx-issue-type", txIssueType, null);
+    iss.getDetails().setText(text);
+    iss.addExpression(expression);
+    return iss;
+  }
+
+  /**
+   * Once a real server round-trip has confirmed (in canonical shape - see maybeRecordServerUnknownSystem)
+   * that it does not know a code system, answer subsequent gate-shaped asks for the same system locally
+   * with the same fully parameterized result the server would return.
+   */
+  private ValidationResult synthesizeUnknownSystemResult(ValidationOptions options, Coding code, ValueSet vs, String localError) {
+    if (!unknownSynthGate(options, code, vs, localError) || !serverConfirmedUnknownSystems.contains(code.getSystem())) {
+      return null;
+    }
+    String server = masterServerAddress();
+    ValidationResult res = new ValidationResult(IssueSeverity.ERROR, unknownSystemMessage(code, vs), TerminologyServiceErrorClass.UNKNOWN, null);
+    res.setDefinition(new ConceptDefinitionComponent().setDisplay(null).setCode(code.getCode()));
+    res.setDisplay(null);
+    res.setSystem(code.getSystem());
+    res.setIssues(unknownSystemIssues(code, vs, server));
+    res.setStatus(false, null);
+    Set<String> unknownSystems = new HashSet<>();
+    unknownSystems.add(code.getSystem());
+    res.setUnknownSystems(unknownSystems);
+    res.setServer(server);
+    return res;
+  }
+
+  /**
+   * Arm the unknown-system memo only when the server's actual response for a gate-shaped request is
+   * exactly the canonical template for that request (message, severity, error class, unknown-systems,
+   * server, and a deep-equal match on both issues). This makes later synthesis byte-identical by
+   * construction: the synthesized result is the same template with only (code, value set) substituted.
+   */
+  private void maybeRecordServerUnknownSystem(ValidationOptions options, Coding code, ValueSet vs, ValidationResult res, String localError) {
+    if (res == null || res.isOk() || !unknownSynthGate(options, code, vs, localError)) {
+      return;
+    }
+    if (serverConfirmedUnknownSystems.contains(code.getSystem())) {
+      return;
+    }
+    if (res.getSeverity() != IssueSeverity.ERROR || res.getErrorClass() != TerminologyServiceErrorClass.UNKNOWN) {
+      return;
+    }
+    if (res.getUnknownSystems() == null || res.getUnknownSystems().size() != 1 || !res.getUnknownSystems().contains(code.getSystem())) {
+      return;
+    }
+    String server = masterServerAddress();
+    if (server == null || !server.equals(res.getServer())) {
+      return;
+    }
+    if (!unknownSystemMessage(code, vs).equals(res.getMessage())) {
+      return;
+    }
+    List<OperationOutcomeIssueComponent> expected = unknownSystemIssues(code, vs, server);
+    if (res.getIssues() == null || res.getIssues().size() != expected.size()) {
+      return;
+    }
+    for (int i = 0; i < expected.size(); i++) {
+      if (!expected.get(i).equalsDeep(res.getIssues().get(i))) {
+        return;
+      }
+    }
+    // a locally loaded code system would have been used by the local validator; never memoize in that case
+    if (fetchCodeSystem(code.getSystem(), ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) != null) {
+      return;
+    }
+    serverConfirmedUnknownSystems.add(code.getSystem());
   }
 
   private void setTerminologyOptions(ValidationOptions options, Parameters pIn) {
