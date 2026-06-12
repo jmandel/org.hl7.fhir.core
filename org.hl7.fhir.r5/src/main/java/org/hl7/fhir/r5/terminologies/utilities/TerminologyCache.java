@@ -1664,6 +1664,18 @@ public class TerminologyCache {
       "(\"name\"\\s*:\\s*\"profile-url\"\\s*,\\s*\"value[A-Za-z]+\"\\s*:\\s*\")" +
       "urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(\")");
 
+  // Rule 2 - "cache-id" parameter values are replaced by a fixed placeholder. The cache-id is a
+  // per-session token the client mints (TerminologyClientContext) so the server can associate the
+  // session's previously-sent resources; it is a transport optimization, never semantic - two
+  // requests differing only in cache-id ask the same logical question. It is also RANDOM per run,
+  // so any request path that sends it (the rendering/narrative client context does, even when the
+  // validation context has cache-id disabled) otherwise produces keys that can never hit a
+  // recorded pack: measured as 24 hermetic violations per run, all narrative-generation
+  // validate-codes whose only run-varying content was the cache-id value.
+  private static final java.util.regex.Pattern CACHE_ID_LABEL = java.util.regex.Pattern.compile(
+      "(\"name\"\\s*:\\s*\"cache-id\"\\s*,\\s*\"value[A-Za-z]+\"\\s*:\\s*\")" +
+      "[^\"]+(\")");
+
   /** canonicalized copy of a request text, for key derivation only (see the rules above) */
   public static String canonicalizeRequest(String request) {
     if (request == null) {
@@ -1671,6 +1683,9 @@ public class TerminologyCache {
     }
     if (request.contains("profile-url")) {
       request = PROFILE_URL_UUID_LABEL.matcher(request).replaceAll("$1"+PROFILE_URL_UUID_PLACEHOLDER+"$2");
+    }
+    if (request.contains("cache-id")) {
+      request = CACHE_ID_LABEL.matcher(request).replaceAll("$1"+PROFILE_URL_UUID_PLACEHOLDER+"$2");
     }
     return request;
   }
