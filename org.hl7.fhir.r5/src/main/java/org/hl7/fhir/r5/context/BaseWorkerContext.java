@@ -1558,6 +1558,14 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       // we had some problem evaluating locally, but the server doesn't know the code system, so we'll just go with the local error
       res = new ValidationResult(IssueSeverity.WARNING, localWarning, null);
       res.setDiagnostics("Local Warning: " + localWarning.trim() + ". Server Error: " + res.getMessage());
+      // this answer is fully determined by localWarning (getMessage() above reads the rebuilt
+      // result, not the server's), so it is safe to cache: without this, the early return skips
+      // the store below and every repeat of this shape (e.g. narrative rendering's lookupCode
+      // of an unknown system, once per example) is a fresh server round trip. TRANSIENT, to
+      // match the keep-trying policy below: the dedupe is per run, never across runs
+      if (cachingAllowed && txCache != null) {
+        txCache.cacheValidation(cacheToken, res, TerminologyCache.TRANSIENT);
+      }
       return res;
     }
     updateUnsupportedCodeSystems(res, code, codeKey);
