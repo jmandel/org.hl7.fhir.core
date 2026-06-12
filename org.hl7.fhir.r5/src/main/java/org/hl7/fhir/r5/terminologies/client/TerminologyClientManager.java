@@ -328,7 +328,7 @@ public class TerminologyClientManager {
 
   private void checkActuallySupports(ServerOptionList choice) {
     for (String s : choice.candidates) {
-      if (isTxFhirOrg(s)) {
+      if (isTxFhirOrg(s) || isPackDescribedServer(s)) {
         return;
       }
     }
@@ -336,10 +336,21 @@ public class TerminologyClientManager {
   }
 
   private boolean isSupportedServer(String server, String url) {
-    if (isTxFhirOrg(server)) {
+    if (isTxFhirOrg(server) || isPackDescribedServer(server)) {
       return true;
     }
     return checkCSAvailable(server, url);
+  }
+
+  /**
+   * True when the answer pack (-Dorg.hl7.fhir.tx.pack=...) carries this server's CapabilityStatement -
+   * i.e. the address is the recorded stand-in for the master terminology server. Live, that master is
+   * tx.fhir.org, which the isTxFhirOrg() shortcuts above trust without ever probing
+   * {@code CodeSystem?url=...}; a pack-described address gets the same trust, so pack replay sends no
+   * probe (and a hermetic run doesn't trip on one), matching the live-run decision path exactly.
+   */
+  private boolean isPackDescribedServer(String s) {
+    return cache != null && cache.getPackCapabilityStatement(s) != null;
   }
 
   private boolean isTxFhirOrg(String s) {

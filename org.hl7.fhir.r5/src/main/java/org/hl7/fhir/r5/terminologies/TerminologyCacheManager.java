@@ -61,7 +61,17 @@ public class TerminologyCacheManager {
   public void initialize() throws IOException {
     File f = ManagedFileAccess.file(cacheFolder);
     if (!f.exists()) {
-      FileUtilities.createDirectory(cacheFolder);      
+      FileUtilities.createDirectory(cacheFolder);
+    }
+    if (isTxPackMode()) {
+      // pack-replay / hermetic builds: the on-disk cache (plus the answer pack) is the source of
+      // truth. The caller never fetched a live server version, so don't compare stamps, don't
+      // clear the cache, and don't try to seed it from the live tx.fhir.org zips - just touch
+      // last-use and keep whatever version stamp the recording run left.
+      IniFile ini = new IniFile(Utilities.path(cacheFolder, "cache.ini"));
+      ini.setDateProperty("cache", "last-use", new Date(), null);
+      ini.save();
+      return;
     }
     if (!version.equals(getCacheVersion())) {
       clearCache();
@@ -79,6 +89,12 @@ public class TerminologyCacheManager {
     ini.setStringProperty("cache", "version", version, null);
     ini.setDateProperty("cache", "last-use", new Date(), null);
     ini.save();
+  }
+
+  /** answer-pack replay or hermetic build: external cache maintenance must stay off-line */
+  private static boolean isTxPackMode() {
+    return System.getProperty(org.hl7.fhir.r5.terminologies.utilities.TerminologyCache.PACK_SYSTEM_PROPERTY) != null
+        || Boolean.getBoolean("org.hl7.fhir.tx.hermetic");
   }
 
   private void fillCache(String source) throws IOException {
