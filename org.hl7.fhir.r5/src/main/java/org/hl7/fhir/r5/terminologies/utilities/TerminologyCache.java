@@ -607,7 +607,7 @@ public class TerminologyCache {
       } else {
         ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vs == null ? "null" : vsEssenceJson(json, vs))+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
-      ct.key = String.valueOf(hashJson(ct.request));
+      ct.key = cacheKeyFor(ct.request);
       return ct;
     } catch (IOException e) {
       throw new Error(e);
@@ -629,7 +629,7 @@ public class TerminologyCache {
       String expJS = composeExpParamsJson(json, expParameters);
 
       ct.request = "{\"code\" : "+json.composeString(code, "code")+", \"valueSet\" :"+(vsUrl == null ? "null" : vsUrl)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
-      ct.key = String.valueOf(hashJson(ct.request));
+      ct.key = cacheKeyFor(ct.request);
       return ct;
     } catch (IOException e) {
       throw new Error(e);
@@ -667,7 +667,7 @@ public class TerminologyCache {
       } else {
         ct.request = "{\"code\" : "+json.composeString(code, "codeableConcept")+", \"valueSet\" :"+vsEssenceJson(json, vs)+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
       }
-      ct.key = String.valueOf(hashJson(ct.request));
+      ct.key = cacheKeyFor(ct.request);
       return ct;
     } catch (IOException e) {
       throw new Error(e);
@@ -700,14 +700,14 @@ public class TerminologyCache {
         throw new Error(e);
       }
     }
-    ct.key = String.valueOf(hashJson(ct.request));
+    ct.key = cacheKeyFor(ct.request);
     return ct;
   }
   
   public CacheToken generateExpandToken(String url, ExpansionOptions options) {
     CacheToken ct = new CacheToken();
     ct.request = "{\"hierarchical\" : "+(options.isHierarchical() ? "true" : "false")+(options.hasLanguage() ?  ", \"language\": \""+options.getLanguage()+"\"" : "")+", \"url\": \""+Utilities.escapeJson(url)+"\"}\r\n";
-    ct.key = String.valueOf(hashJson(ct.request));
+    ct.key = cacheKeyFor(ct.request);
     return ct;
   }
 
@@ -1131,7 +1131,7 @@ public class TerminologyCache {
 
       for (CacheEntry cacheEntry : parseCachePage(src)) {
         c++;
-        nc.map.put(String.valueOf(hashJson(cacheEntry.request)), cacheEntry);
+        nc.map.put(cacheKeyFor(cacheEntry.request), cacheEntry);
         nc.list.add(cacheEntry);
       }
     } catch (Exception e) {
@@ -1192,7 +1192,7 @@ public class TerminologyCache {
     int n = 0;
     try {
       for (CacheEntry cacheEntry : parseCachePage(src)) {
-        m.put(String.valueOf(hashJson(cacheEntry.request)), cacheEntry);
+        m.put(cacheKeyFor(cacheEntry.request), cacheEntry);
         n++;
       }
     } catch (Exception e) {
@@ -1222,7 +1222,7 @@ public class TerminologyCache {
   /** verification hook: true if the pack seed layer holds an entry for this canonical request under the given cache name */
   public boolean packContains(String name, String request) {
     Map<String, CacheEntry> m = packCaches.get(name == null ? "null" : name);
-    return m != null && m.containsKey(hashJson(request));
+    return m != null && m.containsKey(cacheKeyFor(request));
   }
 
   /**
@@ -1317,6 +1317,10 @@ public class TerminologyCache {
   }
 
   public String hashJson(String s) {
+    return hashNormalized(s);
+  }
+
+  private static String hashNormalized(String s) {
     // streaming equivalent of: String.valueOf(s.trim().replaceAll("\\r\\n?", "\n").hashCode())
     // (avoids allocating two large intermediate strings per call; result is identical)
     int start = 0;
@@ -1339,6 +1343,73 @@ public class TerminologyCache {
       h = 31 * h + c;
     }
     return String.valueOf(h);
+  }
+
+  // ----- canonical key normalization ----------------------------------------------------------------
+  //
+  // The cache/pack key for an entry is the hash of a *canonicalized* copy of the request text. The
+  // canonicalization rewrites only constructs that are synthetic identity labels with no semantic
+  // weight, so that logically identical requests made by different runs/environments map to the same
+  // key. It applies ONLY to key derivation: the request text that is sent on the wire, stored in
+  // CacheToken.request, persisted in .cache pages and packed by TerminologyCachePackager is untouched.
+  //
+  // Because every key in the system is *derived* from request text through this one path - token
+  // generation (generate*Token), mutable cache page load (loadNamedCache), pack page load
+  // (loadPackPage) and pack verification (packContains) - the same normalization automatically applies
+  // at pack-build time and lookup time, and caches/packs written before this change are re-keyed
+  // simply by being loaded.
+  //
+  // Every rule must be collision-safe: two logically different requests must never canonicalize to
+  // the same text.
+  //
+  // Rule 1 - uuid-shaped "profile-url" labels in the serialized expansion parameters are replaced by a
+  // fixed placeholder uuid. The profile-url parameter is a synthetic label naming the expansion
+  // parameter set (kindling's BuildWorkerContext and ValidationEngine both populate it with a constant
+  // annotated "change this to blow the cache"; other harnesses generate a fresh uuid per run, which
+  // makes every validation key run-unique and defeats answer packs). Collision safety: every semantic
+  // expansion parameter is serialized in full in the same request text, so two requests that differ in
+  // any actual parameter still differ after normalization; two requests that differ ONLY in the
+  // uuid label are byte-identical in every parameter the server sees and are the same logical request.
+  // The rule is deliberately restricted to urn:uuid-shaped values: an http(s) profile-url may name a
+  // real, server-resolvable expansion profile and is left alone (this also preserves the documented
+  // cache-busting idiom for ValidationEngine's http://hl7.org/fhir/ExpansionProfile/<uuid> constant;
+  // note that for urn:uuid labels the cache-busting lever is intentionally traded away - cache
+  // invalidation for those flows is FIXED_CACHE_VERSION / version.ctl).
+  //
+  // Rules deliberately NOT applied (each would be collision-unsafe):
+  // - transient per-include ValueSet urls ("<vs-url>--<index>", built by ValueSetValidator when it
+  //   throws a single include at the server): for a versioned parent the key is code+url+version+
+  //   options+profile and does NOT embed the include's content, so the index is the ONLY thing in the
+  //   key distinguishing include 0 from include 1 of the same ValueSet. It is also deterministic
+  //   (derived from include position in the ValueSet definition), hence run-stable.
+  // - expansion "language" / validation "langs": a language changes which designations/displays the
+  //   answer carries; "language":"en" and no-language are different logical requests.
+  // - expansion parameter order: preserved verbatim; no order instability has been observed, and
+  //   reordering would mask any server that treats repeating parameters positionally.
+  public static final String PROFILE_URL_UUID_PLACEHOLDER = "urn:uuid:00000000-0000-0000-0000-000000000000";
+
+  private static final java.util.regex.Pattern PROFILE_URL_UUID_LABEL = java.util.regex.Pattern.compile(
+      "(\"name\"\\s*:\\s*\"profile-url\"\\s*,\\s*\"value[A-Za-z]+\"\\s*:\\s*\")" +
+      "urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(\")");
+
+  /** canonicalized copy of a request text, for key derivation only (see the rules above) */
+  public static String canonicalizeRequest(String request) {
+    if (request == null) {
+      return null;
+    }
+    if (request.contains("profile-url")) {
+      request = PROFILE_URL_UUID_LABEL.matcher(request).replaceAll("$1"+PROFILE_URL_UUID_PLACEHOLDER+"$2");
+    }
+    return request;
+  }
+
+  /**
+   * The canonical cache/pack key for a canonical request JSON: the hash of its canonicalized text.
+   * This is the single key-derivation function used by token generation, mutable cache load and
+   * pack load, so build-time and lookup-time keys can never disagree.
+   */
+  public static String cacheKeyFor(String request) {
+    return hashNormalized(canonicalizeRequest(request));
   }
 
   // management
@@ -1573,7 +1644,7 @@ public class TerminologyCache {
       json.setOutputStyle(OutputStyle.PRETTY);
       String expJS = composeExpParamsJson(json, expParameters);
       ct.request = "{\"op\": \"subsumes\", \"parent\" : "+json.composeString(parent, "code")+", \"child\" :"+json.composeString(child, "code")+(options == null ? "" : ", "+options.toJson())+", \"profile\": "+expJS+"}";
-      ct.key = String.valueOf(hashJson(ct.request));
+      ct.key = cacheKeyFor(ct.request);
       return ct;
     } catch (IOException e) {
       throw new Error(e);

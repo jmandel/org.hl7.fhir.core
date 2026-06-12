@@ -42,9 +42,19 @@ import com.google.gson.JsonObject;
  *       values) - and the sha256 of the pack content;</li>
  *   <li>the pack directory is named by that sha256 ({@code txpack-<sha256>}).</li>
  * </ul>
+ * The {@code merge} mode builds one pack from MULTIPLE cache directories (e.g. the original cold-run
+ * corpus plus the mutable-cache delta a later pack-seeded run had to fetch). Entries are deduplicated
+ * by their canonical key ({@link TerminologyCache#cacheKeyFor}, i.e. the post-canonicalization key, so
+ * entries whose request text differs only in normalized-away content collapse to one), poison-filtered
+ * exactly like {@code build}, and a later source supersedes an earlier one on key conflict (the newer
+ * capture of the same logical request wins). Keys are never stored in a pack - they are recomputed
+ * from each entry's request text both here (for dedup) and by the seed-layer loader (for lookup) - so
+ * a canonicalization change automatically re-keys previously captured entries.
+ * <p/>
  * Usage:
  * <pre>
  *   java ... TerminologyCachePackager build  &lt;sourceCacheDir&gt; &lt;outputParentDir&gt;
+ *   java ... TerminologyCachePackager merge  &lt;sourceCacheDir1&gt; &lt;sourceCacheDir2&gt; [...] &lt;outputParentDir&gt;
  *   java ... TerminologyCachePackager verify &lt;packDirOrZip&gt; [sampleCount]
  * </pre>
  */
@@ -180,6 +190,8 @@ public class TerminologyCachePackager {
     public int entriesIn;
     public int entriesKept;
     public int poisonFiltered;
+    public int duplicatesIdentical;   // merge mode: same canonical key, byte-identical entry
+    public int duplicatesSuperseded;  // merge mode: same canonical key, later source replaced earlier
     public JsonObject manifest;
   }
 
@@ -277,6 +289,161 @@ public class TerminologyCachePackager {
     return r;
   }
 
+  /**
+   * Builds one pack from several cache directories. Entries are poison-filtered exactly like
+   * {@link #build}, then deduplicated per page by canonical key ({@link TerminologyCache#cacheKeyFor}:
+   * recomputed here from each entry's request text, never read from anywhere - which is what re-keys
+   * entries captured before a canonicalization change). On a key conflict the entry from the LATER
+   * source directory supersedes the earlier one (the newer capture of the same logical request wins);
+   * byte-identical duplicates are simply dropped. The manifest records all sources and the dedup
+   * accounting.
+   */
+  public static BuildResult merge(List<String> sourceCacheDirs, String outputParentDir) throws IOException {
+    if (sourceCacheDirs.isEmpty()) {
+      throw new IOException("merge requires at least one source cache directory");
+    }
+    for (String d : sourceCacheDirs) {
+      if (!new File(d).isDirectory()) {
+        throw new IOException("Source cache directory not found: "+d);
+      }
+    }
+
+    // page file name -> (canonical key -> entry); LinkedHashMap keeps first-seen order, so the
+    // merged page is the first source's order plus later sources' additions appended
+    Map<String, LinkedHashMap<String, RawEntry>> merged = new TreeMap<>();
+    TreeSet<String> servers = new TreeSet<>();
+    Map<String, TreeSet<String>> effectiveVersions = new TreeMap<>();
+    Map<String, Integer> perSourceKept = new LinkedHashMap<>();
+    int entriesIn = 0;
+    int poison = 0;
+    int dupIdentical = 0;
+    int dupSuperseded = 0;
+
+    for (String dir : sourceCacheDirs) {
+      int keptHere = 0;
+      String[] names = new File(dir).list();
+      java.util.Arrays.sort(names);
+      for (String fn : names) {
+        if (!fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) || fn.startsWith(".")) {
+          continue;
+        }
+        PageParse page = parsePage(fn, FileUtilities.fileToString(Utilities.path(dir, fn)));
+        LinkedHashMap<String, RawEntry> m = merged.computeIfAbsent(fn, k -> new LinkedHashMap<>());
+        for (RawEntry e : page.entries) {
+          entriesIn++;
+          if (isPoison(e.response)) {
+            poison++;
+            continue;
+          }
+          String key = TerminologyCache.cacheKeyFor(e.request);
+          RawEntry prev = m.get(key);
+          if (prev != null) {
+            if (prev.chunk.equals(e.chunk)) {
+              dupIdentical++;
+              continue;
+            }
+            dupSuperseded++; // fall through: later source replaces the earlier capture
+          } else {
+            keptHere++;
+          }
+          m.put(key, e);
+        }
+      }
+      perSourceKept.put(dir, keptHere);
+    }
+
+    Map<String, String> pages = new TreeMap<>();
+    Map<String, Integer> entryCounts = new TreeMap<>();
+    int kept = 0;
+    for (Map.Entry<String, LinkedHashMap<String, RawEntry>> p : merged.entrySet()) {
+      if (p.getValue().isEmpty()) {
+        continue;
+      }
+      PackPageWriter w = new PackPageWriter();
+      for (RawEntry e : p.getValue().values()) {
+        harvestMetadata(p.getKey(), e, servers, effectiveVersions);
+        w.add(e);
+        kept++;
+      }
+      pages.put(p.getKey(), w.close());
+      entryCounts.put(p.getKey().substring(0, p.getKey().length() - TerminologyCache.CACHE_FILE_EXTENSION.length()), w.getCount());
+    }
+
+    String sha256 = sha256OfPages(pages);
+
+    JsonObject manifest = new JsonObject();
+    manifest.addProperty("format", "fhir-tx-cache-pack/1");
+    manifest.addProperty("mode", "merge");
+    SimpleDateFormat df = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
+    df.setTimeZone(TimeZone.getTimeZone("UTC"));
+    manifest.addProperty("generated", df.format(new Date()));
+    JsonArray srcArr = new JsonArray();
+    JsonObject perSource = new JsonObject();
+    for (String d : sourceCacheDirs) {
+      String abs = new File(d).getAbsolutePath();
+      srcArr.add(abs);
+      perSource.addProperty(abs, perSourceKept.get(d));
+      File verFile = new File(d, "version.ctl");
+      if (verFile.exists() && !manifest.has("sourceCacheVersion")) {
+        manifest.addProperty("sourceCacheVersion", FileUtilities.fileToString(verFile).trim());
+      }
+    }
+    manifest.add("sourceCacheDirs", srcArr);
+    manifest.add("entriesKeptPerSource", perSource);
+    JsonArray serverArr = new JsonArray();
+    for (String s : servers) {
+      serverArr.add(s);
+    }
+    manifest.add("sourceServers", serverArr);
+    JsonArray software = new JsonArray();
+    for (String d : sourceCacheDirs) {
+      JsonObject m = new JsonObject();
+      addServerSoftware(new File(d), m);
+      software.addAll(m.getAsJsonArray("serverSoftware"));
+    }
+    manifest.add("serverSoftware", software);
+    manifest.addProperty("entriesIn", entriesIn);
+    manifest.addProperty("entriesKept", kept);
+    manifest.addProperty("poisonFiltered", poison);
+    manifest.addProperty("duplicatesIdentical", dupIdentical);
+    manifest.addProperty("duplicatesSuperseded", dupSuperseded);
+    manifest.addProperty("keying", "canonical (TerminologyCache.cacheKeyFor: keys recomputed from request text after canonicalizeRequest)");
+    JsonObject counts = new JsonObject();
+    for (Map.Entry<String, Integer> e : entryCounts.entrySet()) {
+      counts.addProperty(e.getKey(), e.getValue());
+    }
+    manifest.add("entryCountsPerSystem", counts);
+    JsonObject versions = new JsonObject();
+    for (Map.Entry<String, TreeSet<String>> e : effectiveVersions.entrySet()) {
+      JsonArray arr = new JsonArray();
+      for (String v : e.getValue()) {
+        arr.add(v);
+      }
+      versions.add(e.getKey(), arr);
+    }
+    manifest.add("effectiveVersionsPerSystem", versions);
+    manifest.addProperty("sha256", sha256);
+
+    String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
+    FileUtilities.createDirectory(packPath);
+    for (Map.Entry<String, String> e : pages.entrySet()) {
+      Files.write(Paths.get(Utilities.path(packPath, e.getKey())), e.getValue().getBytes(StandardCharsets.UTF_8));
+    }
+    Files.write(Paths.get(Utilities.path(packPath, "manifest.json")),
+        new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8));
+
+    BuildResult r = new BuildResult();
+    r.packPath = packPath;
+    r.sha256 = sha256;
+    r.entriesIn = entriesIn;
+    r.entriesKept = kept;
+    r.poisonFiltered = poison;
+    r.duplicatesIdentical = dupIdentical;
+    r.duplicatesSuperseded = dupSuperseded;
+    r.manifest = manifest;
+    return r;
+  }
+
   /** pulls server URL and effective system/version pairs out of a captured response */
   private static void harvestMetadata(String fn, RawEntry e, TreeSet<String> servers, Map<String, TreeSet<String>> effectiveVersions) throws IOException {
     char kind = e.response.isEmpty() ? '?' : e.response.charAt(0);
@@ -365,7 +532,7 @@ public class TerminologyCachePackager {
       String name = fn.substring(0, fn.length() - TerminologyCache.CACHE_FILE_EXTENSION.length());
       RawEntry e = page.entries.get(page.entries.size() / 2);
       boolean hit = cache.packContains(name, e.request);
-      System.out.println("  ["+(hit ? "HIT " : "MISS")+"] "+name+" key="+cache.hashJson(e.request)+" request="+e.request.trim().replace("\n", " ").substring(0, Math.min(120, e.request.trim().length())));
+      System.out.println("  ["+(hit ? "HIT " : "MISS")+"] "+name+" key="+TerminologyCache.cacheKeyFor(e.request)+" request="+e.request.trim().replace("\n", " ").substring(0, Math.min(120, e.request.trim().length())));
       checked++;
       if (hit) {
         found++;
@@ -385,6 +552,18 @@ public class TerminologyCachePackager {
       System.out.println("  entries in: "+r.entriesIn+", kept: "+r.entriesKept+", poison filtered: "+r.poisonFiltered);
       System.out.println("  sha256: "+r.sha256);
       System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(r.manifest));
+    } else if (args.length >= 3 && "merge".equals(args[0])) {
+      List<String> sources = new ArrayList<>();
+      for (int i = 1; i < args.length - 1; i++) {
+        sources.add(args[i]);
+      }
+      BuildResult r = merge(sources, args[args.length - 1]);
+      System.out.println("Merged pack written to "+r.packPath);
+      System.out.println("  sources: "+sources);
+      System.out.println("  entries in: "+r.entriesIn+", kept: "+r.entriesKept+", poison filtered: "+r.poisonFiltered
+          +", duplicate keys: "+r.duplicatesIdentical+" identical dropped, "+r.duplicatesSuperseded+" superseded by later source");
+      System.out.println("  sha256: "+r.sha256);
+      System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(r.manifest));
     } else if (args.length >= 2 && "verify".equals(args[0])) {
       int n = args.length >= 3 ? Integer.parseInt(args[2]) : 5;
       boolean ok = verify(args[1], n);
@@ -394,6 +573,7 @@ public class TerminologyCachePackager {
     } else {
       System.out.println("Usage:");
       System.out.println("  TerminologyCachePackager build <sourceCacheDir> <outputParentDir>");
+      System.out.println("  TerminologyCachePackager merge <sourceCacheDir1> <sourceCacheDir2> [...] <outputParentDir>");
       System.out.println("  TerminologyCachePackager verify <packDirOrZip> [sampleCount]");
       System.exit(2);
     }
