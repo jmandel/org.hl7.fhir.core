@@ -416,6 +416,81 @@ class TerminologyCachePackagerTests {
     assertTrue(manager.hasPackResolution("http://example.org/other"));
   }
 
+  /**
+   * Regression: merging a PACK directory (made by build) with a delta cache dir must keep every
+   * external resolution from the pack - above all the NEGATIVE entries, which are stored as json
+   * nulls and were silently dropped when the merged index was re-serialized without serializeNulls
+   * (Gson's default omits null members). A hermetic run consuming such a merged pack died at its
+   * first negative-externals lookup.
+   */
+  @Test
+  void mergeFromPackSourceKeepsAllExternalEntries() throws IOException {
+    System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);
+    // fixture cache dir: N=2 ValueSet externals (1 positive with a file, 1 negative) + 1 negative CodeSystem external
+    Path cacheDir = tempDir("txcache-packmerge-src");
+    writeExternalsCorpus(cacheDir);
+    Path baseParent = tempDir("txpack-packmerge-base");
+    TerminologyCachePackager.BuildResult base = TerminologyCachePackager.build(cacheDir.toString(), baseParent.toString());
+    assertEquals(2, base.manifest.getAsJsonObject("externalArtifacts").get("valueSets").getAsInt());
+
+    // delta cache dir: 1 different external resolution
+    Path delta = tempDir("txcache-packmerge-delta");
+    Files.write(delta.resolve("vs-externals.json"), ("{\n"
+        + "  \"http://example.org/fhir/delta-only\" : null\n"
+        + "}\n").getBytes(StandardCharsets.UTF_8));
+
+    Path mergeParent = tempDir("txpack-packmerge-out");
+    TerminologyCachePackager.BuildResult merge = TerminologyCachePackager.merge(
+        Arrays.asList(base.packPath, delta.toString()), mergeParent.toString());
+
+    // the WRITTEN indexes (not just the manifest counts) must hold the union: N+1 ValueSets, negatives included
+    com.google.gson.JsonObject vsIndex = readJson(new File(merge.packPath, "vs-externals.json"));
+    assertEquals(3, vsIndex.entrySet().size(), "merged vs-externals.json must union the pack's N entries with the delta's 1");
+    assertTrue(vsIndex.has("http://hl7.org/fhir/ValueSet/yesnodontknow"));
+    assertTrue(vsIndex.has("http://example.org/fhir/not-on-server"), "the pack's negative entries must survive the merge");
+    assertTrue(vsIndex.get("http://example.org/fhir/not-on-server").isJsonNull());
+    assertTrue(vsIndex.has("http://example.org/fhir/delta-only"));
+    com.google.gson.JsonObject csIndex = readJson(new File(merge.packPath, "cs-externals.json"));
+    assertEquals(1, csIndex.entrySet().size(), "merged cs-externals.json must keep the pack's negative entry");
+    assertTrue(csIndex.get("http://www.whocc.no/atc").isJsonNull());
+    // every per-resource file the merged indexes reference must exist in the merged pack
+    assertReferencedFilesExist(merge.packPath, vsIndex);
+    assertReferencedFilesExist(merge.packPath, csIndex);
+    assertTrue(new File(merge.packPath, "vs-0001.json").exists());
+
+    // and the seed layer serves all of them, negatives included, without the network
+    System.setProperty(TerminologyCache.PACK_SYSTEM_PROPERTY, merge.packPath);
+    TerminologyCache packSeeded = new TerminologyCache(new Object(), "n/a");
+    assertEquals(3, packSeeded.getPackVsExternalsCount());
+    assertEquals(1, packSeeded.getPackCsExternalsCount());
+    assertNotNull(packSeeded.getValueSet("http://hl7.org/fhir/ValueSet/yesnodontknow"));
+    assertTrue(packSeeded.hasValueSet("http://example.org/fhir/not-on-server"),
+        "negative answer must stay known so a hermetic run does not re-ask the server");
+    assertNull(packSeeded.getValueSet("http://example.org/fhir/not-on-server"));
+    assertTrue(packSeeded.hasCodeSystem("http://www.whocc.no/atc"));
+    assertNull(packSeeded.getCodeSystem("http://www.whocc.no/atc"));
+    assertTrue(packSeeded.hasValueSet("http://example.org/fhir/delta-only"));
+  }
+
+  private static com.google.gson.JsonObject readJson(File f) throws IOException {
+    assertTrue(f.exists(), "missing " + f);
+    return (com.google.gson.JsonObject) new com.google.gson.JsonParser()
+        .parse(new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8));
+  }
+
+  private static void assertReferencedFilesExist(String packPath, com.google.gson.JsonObject index) {
+    for (java.util.Map.Entry<String, com.google.gson.JsonElement> e : index.entrySet()) {
+      if (e.getValue().isJsonNull()) {
+        continue;
+      }
+      com.google.gson.JsonElement fn = e.getValue().getAsJsonObject().get("filename");
+      if (fn != null && !fn.isJsonNull()) {
+        assertTrue(new File(packPath, fn.getAsString()).exists(),
+            "merged pack must carry '" + fn.getAsString() + "' referenced by '" + e.getKey() + "'");
+      }
+    }
+  }
+
   @Test
   void capabilityArtifactsFlowThroughPackToSeedLayer() throws IOException {
     System.clearProperty(TerminologyCache.PACK_SYSTEM_PROPERTY);

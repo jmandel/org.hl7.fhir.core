@@ -732,7 +732,11 @@ public class TerminologyCachePackager {
   private static ExternalArtifacts emitMergedExternals(Map<String, Object[]> vsExternals, Map<String, Object[]> csExternals,
       Map<String, JsonObject> systemMap, boolean anySystemMap) throws IOException {
     ExternalArtifacts res = new ExternalArtifacts();
-    com.google.gson.Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    // serializeNulls is load-bearing: the NEGATIVE resolutions ("not on the server") are stored as
+    // json null values, and Gson's default omits null members - a merged index written without
+    // serializeNulls silently drops every negative entry, so a hermetic run re-asks the network
+    // for each of them and dies. build() copies the indexes verbatim and never hits this.
+    com.google.gson.Gson gson = new GsonBuilder().setPrettyPrinting().serializeNulls().create();
     if (!vsExternals.isEmpty()) {
       int[] counts = emitMergedExternalsIndex(TerminologyCache.VS_EXTERNALS_FILE, vsExternals, res.files, gson);
       res.vsEntries = counts[0];
