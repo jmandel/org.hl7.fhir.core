@@ -168,6 +168,7 @@ public class TerminologyCache {
   public class CacheToken {
     @Getter
     private String name;
+    @Getter
     private String key;
     @Getter
     private String request;

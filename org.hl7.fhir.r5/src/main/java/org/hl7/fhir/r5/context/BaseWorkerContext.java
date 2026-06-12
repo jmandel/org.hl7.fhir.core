@@ -276,6 +276,19 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   // Subsequent vs-bound Coding validations for these systems are answered locally with a result
   // that is byte-identical to what the server would have returned (see synthesizeUnknownSystemResult).
   private final Set<String> serverConfirmedUnknownSystems = Collections.synchronizedSet(new HashSet<String>());
+  // Cache-token keys whose unknown-system answer a LIVE run serves server-shaped from the cache:
+  // the shapes that actually reached the server (or, in a pack/replay run, were first served from
+  // the cache) BEFORE the per-run unsupportedCodeSystems memo was armed for their system. Any OTHER
+  // token's cached unknown-system answer exists only because of shadow recording / the pack: a live
+  // run answers those repeats from the memo suppression in validateCode(Coding), so a cache hit on
+  // them must be discarded in favour of the memo answer to keep live and pack runs answer-shape
+  // identical (see replayMemoShapedUnknownSystem).
+  private final Set<String> serverShapedUnknownSystemTokens = Collections.synchronizedSet(new HashSet<String>());
+  // Stands in for "local evaluation failed" when arming the synthesis memo from a cache/pack-served
+  // answer (where local evaluation was skipped): unknownSynthGate only null-checks localError, and
+  // the deep template match inside maybeRecordServerUnknownSystem implies the local attempt would
+  // have failed (server-confirmed unknown system, no locally loaded CodeSystem - both verified there).
+  private static final String CACHE_SERVED_LOCAL_ERROR_PROXY = "(cache-served)";
   private CanonicalResourceManager<ValueSet> valueSets = new CanonicalResourceManager<ValueSet>(false, minimalMemory);
   private CanonicalResourceManager<ConceptMap> maps = new CanonicalResourceManager<ConceptMap>(false, minimalMemory);
   protected CanonicalResourceManager<StructureMap> transforms = new CanonicalResourceManager<StructureMap>(false, minimalMemory);
@@ -399,6 +412,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       version = other.version;
       supportedCodeSystems.putAll(other.supportedCodeSystems);
       unsupportedCodeSystems.addAll(other.unsupportedCodeSystems);
+      serverShapedUnknownSystemTokens.addAll(other.serverShapedUnknownSystemTokens); // must travel with unsupportedCodeSystems: the discard predicate consults both
       codeSystemsUsed.addAll(other.codeSystemsUsed);
       ucumService = other.ucumService;
       binaries.putAll(other.binaries);
@@ -1230,8 +1244,22 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       if (t.getCoding().hasSystem()) {
         codeSystemsUsed.add(t.getCoding().getSystem());
       }
-      if (txCache != null) { 
-        t.setResult(txCache.getValidation(t.getCacheToken()));
+      if (txCache != null) {
+        ValidationResult cached = txCache.getValidation(t.getCacheToken());
+        if (cached != null) {
+          String codeKey = getCodeKey(t.getCoding());
+          if (replayMemoShapedUnknownSystem(cached, t.getCoding(), codeKey, t.getCacheToken())) {
+            // ANSWER-SHAPE PRECEDENCE (live parity, same as validateCode(Coding)): live runs only
+            // have pre-arming unknown-system answers in their cache; this entry exists only via
+            // shadow recording / the pack. Leave the result unset so the request falls through to
+            // the unsupportedCodeSystems suppression below, which answers it memo-shaped exactly
+            // as a live run would (the batch path never arms the memos itself - also live parity).
+            cached = null;
+          } else {
+            noteServerShapedUnknownSystemToken(t.getCacheToken(), cached, t.getCoding(), codeKey);
+          }
+        }
+        t.setResult(cached);
       }
     }
     if (options.isUseClient()) {
@@ -1277,8 +1305,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
           // and excludes it from the server batch, so the request shape would never reach the
           // recorded pack; remember it so the exact request is still sent (and its answer cached)
           // after the real batch below, without touching the result we just set.
+          // (the extra getValidation check keeps shadow sends deduped now that answer-shape
+          // precedence can route an already-cached token to this suppression point)
           if (TerminologyCache.isRecordSemanticErrors() && txCache != null && t.getCacheToken() != null
-              && !noTerminologyServer && terminologyClientManager.hasClient()) {
+              && !noTerminologyServer && terminologyClientManager.hasClient()
+              && txCache.getValidation(t.getCacheToken()) == null) {
             if (shadowItems == null) {
               shadowItems = new ArrayList<>();
             }
@@ -1324,6 +1355,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
         if (r.getResource() instanceof Parameters) {
           t.setResult(processValidationResult((Parameters) r.getResource(), null, tc.getAddress()));
+          // a real (pre-arming) server answer that live runs serve from cache on repeats: make
+          // sure the answer-shape precedence check never discards its cached entry
+          noteServerShapedUnknownSystemToken(t.getCacheToken(), t.getResult(), t.getCoding(), getCodeKey(t.getCoding()));
           if (txCache != null) {
             txCache.cacheValidation(t.getCacheToken(), t.getResult(), TerminologyCache.PERMANENT);
           }
@@ -1486,8 +1520,23 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       res = txCache.getValidation(cacheToken);
     }
     if (res != null) {
-      updateUnsupportedCodeSystems(res, code, getCodeKey(code));
-      return res;
+      final String codeKey = getCodeKey(code);
+      if (replayMemoShapedUnknownSystem(res, code, codeKey, cacheToken)) {
+        // ANSWER-SHAPE PRECEDENCE (live parity): a live run never has this token in its cache - the
+        // entry exists only via shadow recording / the pack. Live, this repeat probe of a
+        // confirmed-unknown system is answered by the per-run unsupportedCodeSystems memo below
+        // (no server-tagged issues), not by the server-shaped answer. Discard the cached answer and
+        // fall through to local evaluation + the memo suppression, exactly as the live repeat path.
+        res = null;
+      } else {
+        // first ask of the run for this shape (or a shape a live run also serves from cache):
+        // serve the cached/pack answer as today, and arm the same memos the live server path arms
+        // after a round trip, so subsequent probes take the memo-shaped path in every mode.
+        noteServerShapedUnknownSystemToken(cacheToken, res, code, codeKey);
+        updateUnsupportedCodeSystems(res, code, codeKey);
+        maybeRecordServerUnknownSystem(options, code, vs, res, CACHE_SERVED_LOCAL_ERROR_PROXY);
+        return res;
+      }
     }
 
     // local-first answering for grammar-based code systems (UCUM / BCP-47 / BCP-13), restricted to
@@ -1643,6 +1692,10 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       res.setDiagnostics("Local Warning: "+localWarning.trim()+". Server Error: "+res.getMessage());
       return res;
     }
+    // this token's answer was obtained pre-arming (the memo suppression above did not intercept
+    // it), so a live run serves its repeats server-shaped from the cache: remember that, so the
+    // precedence check on the cache-hit path above never discards it
+    noteServerShapedUnknownSystemToken(cacheToken, res, code, codeKey);
     updateUnsupportedCodeSystems(res, code, codeKey);
     if (cachingAllowed && txCache != null) { // we never cache unsupported code systems - we always keep trying (but only once per run)
       txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
@@ -1791,6 +1844,55 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     }
   }
 
+  /**
+   * The answer-shape predicate shared with the two unknown-system suppression points: true when a
+   * result is the kind of answer the per-run memos suppress repeats of - errorClass
+   * CODESYSTEM_UNSUPPORTED (the class updateUnsupportedCodeSystems arms on, which both the
+   * shadow-recorded server answers and the memo answer itself carry), or the canonical
+   * errorClass-UNKNOWN unknown-system shape that maybeRecordServerUnknownSystem confirms and
+   * synthesizeUnknownSystemResult reproduces (recognised by the system in unknown-systems).
+   */
+  private boolean isUnknownSystemShapedResult(ValidationResult res, Coding code, String codeKey) {
+    if (res == null || res.isOk()) {
+      return false;
+    }
+    if (res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED) {
+      return true;
+    }
+    return res.getErrorClass() == TerminologyServiceErrorClass.UNKNOWN && res.getUnknownSystems() != null
+        && (res.getUnknownSystems().contains(code.getSystem()) || res.getUnknownSystems().contains(codeKey));
+  }
+
+  /**
+   * True when a cached/pack unknown-system answer must be DISCARDED in favour of the per-run memo
+   * answer to match live answer-shape precedence: the unsupportedCodeSystems memo is already armed
+   * for this system, and this token is not one whose answer a live run also serves server-shaped
+   * from its cache (i.e. it was not obtained before the memo armed - see
+   * serverShapedUnknownSystemTokens). The caller falls through to local evaluation + the memo
+   * suppression, which - because the memo is armed - is guaranteed to answer without a server call.
+   */
+  private boolean replayMemoShapedUnknownSystem(ValidationResult cached, Coding code, String codeKey, CacheToken token) {
+    return token != null && token.getKey() != null
+        && unsupportedCodeSystems.contains(codeKey)
+        && isUnknownSystemShapedResult(cached, code, codeKey)
+        && !serverShapedUnknownSystemTokens.contains(token.getKey());
+  }
+
+  /**
+   * Record a token whose unknown-system answer was served while the unsupportedCodeSystems memo was
+   * NOT yet armed for its system: live runs cache exactly these answers (server round trips that the
+   * memo did not intercept) and serve their repeats server-shaped from the cache, so the precedence
+   * check must never discard them.
+   */
+  private void noteServerShapedUnknownSystemToken(CacheToken token, ValidationResult res, Coding code, String codeKey) {
+    if (token == null || token.getKey() == null || unsupportedCodeSystems.contains(codeKey)) {
+      return;
+    }
+    if (isUnknownSystemShapedResult(res, code, codeKey)) {
+      serverShapedUnknownSystemTokens.add(token.getKey());
+    }
+  }
+
   // ---- SHADOW RECORDING of suppressed unknown-system server asks -------------------------------
   //
   // During a recording run (-Dorg.hl7.fhir.tx.recordSemanticErrors=true) the per-run
@@ -1827,6 +1929,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       String localError, String localWarning, TerminologyServiceErrorClass type, String codeKey) {
     if (!TerminologyCache.isRecordSemanticErrors() || txCache == null || !cachingAllowed || cacheToken == null
         || noTerminologyServer || !terminologyClientManager.hasClient()) {
+      return;
+    }
+    if (txCache.getValidation(cacheToken) != null) {
+      // already recorded: with answer-shape precedence (replayMemoShapedUnknownSystem) a repeat
+      // whose cached answer was discarded in favour of the memo answer reaches this suppression
+      // point even though its token is in the cache; re-sending would only rewrite identical bytes
       return;
     }
     try {
