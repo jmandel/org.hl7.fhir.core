@@ -198,10 +198,11 @@ public class TerminologyClientContext {
         capabilitiesStatement = packCS;
       } else {
         // we don't REUSE a previously cached quick CS - we want to know that the server is with us -
-        // but we do capture it, so that a preserved cache dir packages into an answer pack that can
-        // serve client init offline (TerminologyCachePackager)
+        // but a RECORDING run captures it, so the preserved cache dir packages into an answer pack
+        // that can serve client init offline (TerminologyCachePackager). Default runs must not
+        // write a file the code never reads back (txCache dirs are sometimes source-controlled)
         capabilitiesStatement = client.getCapabilitiesStatement();
-        if (txCache != null) {
+        if (txCache != null && TerminologyCache.isRecordSemanticErrors()) {
           try {
             txCache.cacheCapabilityStatement(getAddress(), capabilitiesStatement);
           } catch (IOException e) {

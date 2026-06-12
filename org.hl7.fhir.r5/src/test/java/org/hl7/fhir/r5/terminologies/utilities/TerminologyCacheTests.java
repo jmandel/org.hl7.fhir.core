@@ -622,4 +622,53 @@ public class TerminologyCacheTests implements ResourceLoaderTests {
 
     assertEquals(paddedJsonToken, jsonToken);
   }
+
+  // ---- canonicalizeRequest / key derivation rules -------------------------------------------
+
+  @Test
+  void canonicalizeReplacesProfileUrlUuidWithPlaceholder() {
+    String a = "{\"profile\": {\"parameter\": [{\"name\" : \"profile-url\", \"valueString\" : \"urn:uuid:11111111-2222-3333-4444-555555555555\"}]}}";
+    String b = "{\"profile\": {\"parameter\": [{\"name\" : \"profile-url\", \"valueString\" : \"urn:uuid:99999999-8888-7777-6666-555555555555\"}]}}";
+    assertEquals(TerminologyCache.canonicalizeRequest(a), TerminologyCache.canonicalizeRequest(b));
+    assertEquals(TerminologyCache.canonicalKeyFor(a), TerminologyCache.canonicalKeyFor(b));
+  }
+
+  @Test
+  void canonicalizeReplacesCacheIdValuesWithPlaceholder() {
+    String a = "{\"parameter\": [{\"name\" : \"cache-id\", \"valueId\" : \"run-one-token\"}]}";
+    String b = "{\"parameter\": [{\"name\" : \"cache-id\", \"valueId\" : \"run-two-token\"}]}";
+    assertEquals(TerminologyCache.canonicalKeyFor(a), TerminologyCache.canonicalKeyFor(b));
+  }
+
+  @Test
+  void canonicalizeDoesNotCollideDistinctSemanticContent() {
+    // a NON-profile-url uuid and a NON-cache-id value must keep distinguishing requests
+    String a = "{\"code\": {\"system\" : \"urn:uuid:11111111-2222-3333-4444-555555555555\", \"code\" : \"x\"}}";
+    String b = "{\"code\": {\"system\" : \"urn:uuid:99999999-8888-7777-6666-555555555555\", \"code\" : \"x\"}}";
+    org.junit.jupiter.api.Assertions.assertNotEquals(
+        TerminologyCache.canonicalKeyFor(a), TerminologyCache.canonicalKeyFor(b));
+    String c = "{\"parameter\": [{\"name\" : \"url\", \"valueString\" : \"http://a.example\"}]}";
+    String d = "{\"parameter\": [{\"name\" : \"url\", \"valueString\" : \"http://b.example\"}]}";
+    org.junit.jupiter.api.Assertions.assertNotEquals(
+        TerminologyCache.canonicalKeyFor(c), TerminologyCache.canonicalKeyFor(d));
+  }
+
+  @Test
+  void stockKeysApplyUnlessPackMachineryActive() {
+    // default mode (no pack property, not recording): keys are the stock hash, NOT canonicalized,
+    // so existing on-disk caches keep their keys across the upgrade
+    org.junit.jupiter.api.Assumptions.assumeTrue(System.getProperty(TerminologyCache.PACK_SYSTEM_PROPERTY) == null);
+    boolean prior = TerminologyCache.isRecordSemanticErrors();
+    try {
+      TerminologyCache.setRecordSemanticErrors(false);
+      String a = "{\"parameter\": [{\"name\" : \"cache-id\", \"valueId\" : \"run-one-token\"}]}";
+      String b = "{\"parameter\": [{\"name\" : \"cache-id\", \"valueId\" : \"run-two-token\"}]}";
+      org.junit.jupiter.api.Assertions.assertNotEquals(
+          TerminologyCache.cacheKeyFor(a), TerminologyCache.cacheKeyFor(b));
+      TerminologyCache.setRecordSemanticErrors(true);
+      assertEquals(TerminologyCache.cacheKeyFor(a), TerminologyCache.cacheKeyFor(b));
+    } finally {
+      TerminologyCache.setRecordSemanticErrors(prior);
+    }
+  }
 }

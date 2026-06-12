@@ -18,6 +18,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 import org.hl7.fhir.utilities.FileUtilities;
+import org.hl7.fhir.utilities.filesystem.ManagedFileAccess;
 import org.hl7.fhir.utilities.Utilities;
 
 import com.google.gson.GsonBuilder;
@@ -63,7 +64,7 @@ import com.google.gson.JsonObject;
  * usage text of {@link #main} for the step-by-step recipe.
  * The {@code merge} mode builds one pack from MULTIPLE cache directories (e.g. the original cold-run
  * corpus plus the mutable-cache delta a later pack-seeded run had to fetch). Entries are deduplicated
- * by their canonical key ({@link TerminologyCache#cacheKeyFor}, i.e. the post-canonicalization key, so
+ * by their canonical key ({@link TerminologyCache#canonicalKeyFor}, the post-canonicalization key, so
  * entries whose request text differs only in normalized-away content collapse to one), poison-filtered
  * exactly like {@code build}, and a later source supersedes an earlier one on key conflict (the newer
  * capture of the same logical request wins). Keys are never stored in a pack - they are recomputed
@@ -259,7 +260,7 @@ public class TerminologyCachePackager {
   }
 
   public static BuildResult build(String sourceCacheDir, String outputParentDir) throws IOException {
-    File src = new File(sourceCacheDir);
+    File src = ManagedFileAccess.file(sourceCacheDir);
     if (!src.isDirectory()) {
       throw new IOException("Source cache directory not found: "+sourceCacheDir);
     }
@@ -299,7 +300,7 @@ public class TerminologyCachePackager {
 
     Map<String, String> artifacts = collectCapabilityArtifacts(src);
     if (!artifacts.isEmpty()) {
-      File serversIni = new File(src, TerminologyCache.SERVERS_INI_FILE);
+      File serversIni = ManagedFileAccess.file(src, TerminologyCache.SERVERS_INI_FILE);
       if (!serversIni.exists()) {
         throw new IOException("Cache dir "+sourceCacheDir+" has capability pages but no "+TerminologyCache.SERVERS_INI_FILE+" to resolve their server addresses");
       }
@@ -318,7 +319,7 @@ public class TerminologyCachePackager {
     df.setTimeZone(TimeZone.getTimeZone("UTC"));
     manifest.addProperty("generated", df.format(new Date()));
     manifest.addProperty("sourceCacheDir", src.getAbsolutePath());
-    File verFile = new File(src, "version.ctl");
+    File verFile = ManagedFileAccess.file(src, "version.ctl");
     if (verFile.exists()) {
       manifest.addProperty("sourceCacheVersion", FileUtilities.fileToString(verFile).trim());
     }
@@ -356,10 +357,9 @@ public class TerminologyCachePackager {
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
     FileUtilities.createDirectory(packPath);
     for (Map.Entry<String, String> e : packFiles.entrySet()) {
-      Files.write(Paths.get(Utilities.path(packPath, e.getKey())), e.getValue().getBytes(StandardCharsets.UTF_8));
+      FileUtilities.bytesToFile(e.getValue().getBytes(StandardCharsets.UTF_8), Utilities.path(packPath, e.getKey()));
     }
-    Files.write(Paths.get(Utilities.path(packPath, "manifest.json")),
-        new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8));
+    FileUtilities.bytesToFile(new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8), Utilities.path(packPath, "manifest.json"));
 
     BuildResult r = new BuildResult();
     r.packPath = packPath;
@@ -410,7 +410,7 @@ public class TerminologyCachePackager {
     int[] csCounts = collectExternalsIndex(src, TerminologyCache.CS_EXTERNALS_FILE, res.files);
     res.csEntries = csCounts[0];
     res.csNegative = csCounts[1];
-    File systemMap = new File(src, TerminologyCache.SYSTEM_MAP_FILE);
+    File systemMap = ManagedFileAccess.file(src, TerminologyCache.SYSTEM_MAP_FILE);
     if (systemMap.exists()) {
       String text = FileUtilities.fileToString(systemMap);
       res.files.put(TerminologyCache.SYSTEM_MAP_FILE, text);
@@ -421,7 +421,7 @@ public class TerminologyCachePackager {
 
   /** copies one externals index verbatim plus every per-resource file it references; returns {entries, negative} */
   private static int[] collectExternalsIndex(File src, String indexName, Map<String, String> into) throws IOException {
-    File index = new File(src, indexName);
+    File index = ManagedFileAccess.file(src, indexName);
     if (!index.exists()) {
       return new int[] { 0, 0 };
     }
@@ -440,7 +440,7 @@ public class TerminologyCachePackager {
         continue; // entry carries only a server; nothing to copy
       }
       String fn = fnEl.getAsString();
-      File rf = new File(src, fn);
+      File rf = ManagedFileAccess.file(src, fn);
       if (!rf.exists()) {
         throw new IOException(indexName+" entry '"+e.getKey()+"' references missing file '"+fn+"' in "+src);
       }
@@ -479,7 +479,7 @@ public class TerminologyCachePackager {
     java.util.Arrays.sort(names);
     for (String fn : names) {
       if (isCapabilityArtifact(fn)) {
-        artifacts.put(fn, FileUtilities.fileToString(new File(src, fn)));
+        artifacts.put(fn, FileUtilities.fileToString(ManagedFileAccess.file(src, fn)));
       }
     }
     return artifacts;
@@ -492,7 +492,7 @@ public class TerminologyCachePackager {
 
   /**
    * Builds one pack from several cache directories. Entries are poison-filtered exactly like
-   * {@link #build}, then deduplicated per page by canonical key ({@link TerminologyCache#cacheKeyFor}:
+   * {@link #build}, then deduplicated per page by canonical key ({@link TerminologyCache#canonicalKeyFor}:
    * recomputed here from each entry's request text, never read from anywhere - which is what re-keys
    * entries captured before a canonicalization change). On a key conflict the entry from the LATER
    * source directory supersedes the earlier one (the newer capture of the same logical request wins);
@@ -504,7 +504,7 @@ public class TerminologyCachePackager {
       throw new IOException("merge requires at least one source cache directory");
     }
     for (String d : sourceCacheDirs) {
-      if (!new File(d).isDirectory()) {
+      if (!ManagedFileAccess.file(d).isDirectory()) {
         throw new IOException("Source cache directory not found: "+d);
       }
     }
@@ -529,11 +529,11 @@ public class TerminologyCachePackager {
 
     for (String dir : sourceCacheDirs) {
       int keptHere = 0;
-      artifacts.putAll(collectCapabilityArtifacts(new File(dir)));
-      mergeExternalsIndex(new File(dir), TerminologyCache.VS_EXTERNALS_FILE, mergedVsExternals);
-      mergeExternalsIndex(new File(dir), TerminologyCache.CS_EXTERNALS_FILE, mergedCsExternals);
-      anySystemMap |= mergeSystemMap(new File(dir), mergedSystemMap);
-      File serversIni = new File(dir, TerminologyCache.SERVERS_INI_FILE);
+      artifacts.putAll(collectCapabilityArtifacts(ManagedFileAccess.file(dir)));
+      mergeExternalsIndex(ManagedFileAccess.file(dir), TerminologyCache.VS_EXTERNALS_FILE, mergedVsExternals);
+      mergeExternalsIndex(ManagedFileAccess.file(dir), TerminologyCache.CS_EXTERNALS_FILE, mergedCsExternals);
+      anySystemMap |= mergeSystemMap(ManagedFileAccess.file(dir), mergedSystemMap);
+      File serversIni = ManagedFileAccess.file(dir, TerminologyCache.SERVERS_INI_FILE);
       if (serversIni.exists()) {
         for (Map.Entry<String, String> e : TerminologyCache.parseServersIni(FileUtilities.fileToString(serversIni)).entrySet()) {
           String prev = mergedServerIds.put(e.getKey(), e.getValue());
@@ -543,7 +543,7 @@ public class TerminologyCachePackager {
           }
         }
       }
-      String[] names = new File(dir).list();
+      String[] names = ManagedFileAccess.file(dir).list();
       java.util.Arrays.sort(names);
       for (String fn : names) {
         if (!fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) || fn.startsWith(".")) {
@@ -557,7 +557,7 @@ public class TerminologyCachePackager {
             poison++;
             continue;
           }
-          String key = TerminologyCache.cacheKeyFor(e.request);
+          String key = TerminologyCache.canonicalKeyFor(e.request);
           RawEntry prev = m.get(key);
           if (prev != null) {
             if (prev.chunk.equals(e.chunk)) {
@@ -617,10 +617,10 @@ public class TerminologyCachePackager {
     JsonArray srcArr = new JsonArray();
     JsonObject perSource = new JsonObject();
     for (String d : sourceCacheDirs) {
-      String abs = new File(d).getAbsolutePath();
+      String abs = ManagedFileAccess.file(d).getAbsolutePath();
       srcArr.add(abs);
       perSource.addProperty(abs, perSourceKept.get(d));
-      File verFile = new File(d, "version.ctl");
+      File verFile = ManagedFileAccess.file(d, "version.ctl");
       if (verFile.exists() && !manifest.has("sourceCacheVersion")) {
         manifest.addProperty("sourceCacheVersion", FileUtilities.fileToString(verFile).trim());
       }
@@ -635,7 +635,7 @@ public class TerminologyCachePackager {
     JsonArray software = new JsonArray();
     for (String d : sourceCacheDirs) {
       JsonObject m = new JsonObject();
-      addServerSoftware(new File(d), m);
+      addServerSoftware(ManagedFileAccess.file(d), m);
       software.addAll(m.getAsJsonArray("serverSoftware"));
     }
     manifest.add("serverSoftware", software);
@@ -644,7 +644,7 @@ public class TerminologyCachePackager {
     manifest.addProperty("poisonFiltered", poison);
     manifest.addProperty("duplicatesIdentical", dupIdentical);
     manifest.addProperty("duplicatesSuperseded", dupSuperseded);
-    manifest.addProperty("keying", "canonical (TerminologyCache.cacheKeyFor: keys recomputed from request text after canonicalizeRequest)");
+    manifest.addProperty("keying", "canonical (TerminologyCache.canonicalKeyFor: keys recomputed from request text after canonicalizeRequest)");
     JsonObject counts = new JsonObject();
     for (Map.Entry<String, Integer> e : entryCounts.entrySet()) {
       counts.addProperty(e.getKey(), e.getValue());
@@ -670,10 +670,9 @@ public class TerminologyCachePackager {
     String packPath = Utilities.path(outputParentDir, "txpack-"+sha256);
     FileUtilities.createDirectory(packPath);
     for (Map.Entry<String, String> e : packFiles.entrySet()) {
-      Files.write(Paths.get(Utilities.path(packPath, e.getKey())), e.getValue().getBytes(StandardCharsets.UTF_8));
+      FileUtilities.bytesToFile(e.getValue().getBytes(StandardCharsets.UTF_8), Utilities.path(packPath, e.getKey()));
     }
-    Files.write(Paths.get(Utilities.path(packPath, "manifest.json")),
-        new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8));
+    FileUtilities.bytesToFile(new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8), Utilities.path(packPath, "manifest.json"));
 
     BuildResult r = new BuildResult();
     r.packPath = packPath;
@@ -694,7 +693,7 @@ public class TerminologyCachePackager {
    * {@link #emitMergedExternals} copies the per-resource file from the dir whose entry won.
    */
   private static void mergeExternalsIndex(File src, String indexName, Map<String, Object[]> into) throws IOException {
-    File index = new File(src, indexName);
+    File index = ManagedFileAccess.file(src, indexName);
     if (!index.exists()) {
       return;
     }
@@ -706,7 +705,7 @@ public class TerminologyCachePackager {
 
   /** folds one source's system-map.json into the merged map (system -> entry; later source wins); true if present */
   private static boolean mergeSystemMap(File src, Map<String, JsonObject> into) throws IOException {
-    File f = new File(src, TerminologyCache.SYSTEM_MAP_FILE);
+    File f = ManagedFileAccess.file(src, TerminologyCache.SYSTEM_MAP_FILE);
     if (!f.exists()) {
       return false;
     }
@@ -777,7 +776,7 @@ public class TerminologyCachePackager {
         continue;
       }
       String fn = fnEl.getAsString();
-      File rf = new File(src, fn);
+      File rf = ManagedFileAccess.file(src, fn);
       if (!rf.exists()) {
         throw new IOException(indexName+" entry '"+e.getKey()+"' references missing file '"+fn+"' in "+src);
       }
@@ -821,7 +820,7 @@ public class TerminologyCachePackager {
     for (String fn : names) {
       if (fn.startsWith(".capabilityStatement") && fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION)) {
         try {
-          JsonObject cs = (JsonObject) new com.google.gson.JsonParser().parse(FileUtilities.fileToString(new File(src, fn)));
+          JsonObject cs = (JsonObject) new com.google.gson.JsonParser().parse(FileUtilities.fileToString(ManagedFileAccess.file(src, fn)));
           if (cs.has("software")) {
             software.add(cs.getAsJsonObject("software"));
           }
@@ -869,25 +868,46 @@ public class TerminologyCachePackager {
         +(cache.getPackSystemMapSource() != null ? "present" : "absent"));
 
     // sample entries spread across pages, looked up via packContains (name + canonical request -> key)
-    File pf = new File(packPath);
+    File pf = ManagedFileAccess.file(packPath);
     List<String> pageNames = new ArrayList<>();
-    for (String fn : pf.list()) {
-      if (fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) && !isCapabilityArtifact(fn)) {
-        pageNames.add(fn);
+    Map<String, String> pageTexts = new LinkedHashMap<>();
+    if (pf.isDirectory()) {
+      String[] listed = pf.list();
+      if (listed == null) {
+        throw new IOException("Unable to list terminology pack directory: "+packPath);
+      }
+      for (String fn : listed) {
+        if (fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) && !isCapabilityArtifact(fn)) {
+          pageNames.add(fn);
+          pageTexts.put(fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
+        }
+      }
+    } else {
+      // zip pack: the seed layer above loaded it via the system property; sample the zip directly
+      try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(pf)) {
+        java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+        while (en.hasMoreElements()) {
+          java.util.zip.ZipEntry ze = en.nextElement();
+          String fn = ze.getName();
+          if (!ze.isDirectory() && fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) && !isCapabilityArtifact(fn)) {
+            pageNames.add(fn);
+            pageTexts.put(fn, new String(zf.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8));
+          }
+        }
       }
     }
     java.util.Collections.sort(pageNames);
     int checked = 0, found = 0;
     outer:
     for (String fn : pageNames) {
-      PageParse page = parsePage(fn, FileUtilities.fileToString(Utilities.path(packPath, fn)));
+      PageParse page = parsePage(fn, pageTexts.get(fn));
       if (page.entries.isEmpty()) {
         continue;
       }
       String name = fn.substring(0, fn.length() - TerminologyCache.CACHE_FILE_EXTENSION.length());
       RawEntry e = page.entries.get(page.entries.size() / 2);
       boolean hit = cache.packContains(name, e.request);
-      System.out.println("  ["+(hit ? "HIT " : "MISS")+"] "+name+" key="+TerminologyCache.cacheKeyFor(e.request)+" request="+e.request.trim().replace("\n", " ").substring(0, Math.min(120, e.request.trim().length())));
+      System.out.println("  ["+(hit ? "HIT " : "MISS")+"] "+name+" key="+TerminologyCache.canonicalKeyFor(e.request)+" request="+e.request.trim().replace("\n", " ").substring(0, Math.min(120, e.request.trim().length())));
       checked++;
       if (hit) {
         found++;

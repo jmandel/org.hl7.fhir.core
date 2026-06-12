@@ -1246,7 +1246,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       }
       if (txCache != null) {
         ValidationResult cached = txCache.getValidation(t.getCacheToken());
-        if (cached != null) {
+        if (cached != null && packReplayParityActive()) {
+          // the precedence/arming machinery is pack-replay/recording-only; default runs serve
+          // cached answers exactly as stock does (see validateCode(Coding))
           String codeKey = getCodeKey(t.getCoding());
           if (replayMemoShapedUnknownSystem(cached, t.getCoding(), codeKey, t.getCacheToken())) {
             // ANSWER-SHAPE PRECEDENCE (live parity, same as validateCode(Coding)): live runs only
@@ -1520,6 +1522,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       res = txCache.getValidation(cacheToken);
     }
     if (res != null) {
+      if (!packReplayParityActive()) {
+        // default mode: serve cached answers exactly as stock does - the precedence/arming
+        // machinery below exists to make pack replay and recording match live answer shapes,
+        // and must not change behavior for runs using only the ordinary mutable cache
+        return res;
+      }
       final String codeKey = getCodeKey(code);
       if (replayMemoShapedUnknownSystem(res, code, codeKey, cacheToken)) {
         // ANSWER-SHAPE PRECEDENCE (live parity): a live run never has this token in its cache - the
@@ -1693,9 +1701,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       // this answer is fully determined by localWarning (getMessage() above reads the rebuilt
       // result, not the server's), so it is safe to cache: without this, the early return skips
       // the store below and every repeat of this shape is a fresh server round trip - and a
-      // recording run can never make the shape packable (it is the narrative-path residual)
+      // recording run can never make the shape packable (it is the narrative-path residual).
+      // TRANSIENT by default, matching the adjacent "keep trying (but only once per run)" policy
+      // for unknown-system answers; recording runs persist it so the shape lands in the pack
       if (cachingAllowed && txCache != null) {
-        txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
+        txCache.cacheValidation(cacheToken, res,
+            TerminologyCache.isRecordSemanticErrors() ? TerminologyCache.PERMANENT : TerminologyCache.TRANSIENT);
       }
       return res;
     }
@@ -1878,6 +1889,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
    * serverShapedUnknownSystemTokens). The caller falls through to local evaluation + the memo
    * suppression, which - because the memo is armed - is guaranteed to answer without a server call.
    */
+  /**
+   * The answer-shape precedence / memo-arming machinery exists to make pack replay and recording
+   * runs match live answer shapes. It is active only when a pack seed layer is loaded or a
+   * recording run is in progress; in default runs (ordinary mutable cache only) the cache-hit
+   * paths behave exactly as stock.
+   */
+  private boolean packReplayParityActive() {
+    return txCache != null && (txCache.hasPackLoaded() || TerminologyCache.isRecordSemanticErrors());
+  }
+
   private boolean replayMemoShapedUnknownSystem(ValidationResult cached, Coding code, String codeKey, CacheToken token) {
     return token != null && token.getKey() != null
         && unsupportedCodeSystems.contains(codeKey)
@@ -2276,7 +2297,9 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   private ValidationResult localValidationMemoGet(String key) {
-    if (key == null) {
+    if (key == null || !cachingAllowed) {
+      // an embedder that disabled caching (setCachingAllowed(false)) has asked for fresh
+      // evaluation every time; the memo is a cache and must honor that
       return null;
     }
     ValidationResult hit = localValidationMemo.get(key);
@@ -2284,7 +2307,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   }
 
   private void localValidationMemoPut(String key, ValidationResult res) {
-    if (key != null && res != null && localValidationMemo.size() < EVAL_MEMO_MAX_VALIDATION_ENTRIES) {
+    if (key != null && cachingAllowed && res != null && localValidationMemo.size() < EVAL_MEMO_MAX_VALIDATION_ENTRIES) {
       localValidationMemo.putIfAbsent(key, evalMemoCopyResult(res));
     }
   }
@@ -2340,7 +2363,10 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
   // a full spec build) to be identical to what the server would return. Anything outside the verified
   // shape goes to the server exactly as before.
 
-  private static final boolean LOCAL_FIRST_TX = !"false".equals(System.getProperty("org.hl7.fhir.tx.localFirst"));
+  // opt-in: local-first routing changes which component answers a request (not the bytes - the
+  // synthesized shapes are parity-verified), but a default must not reroute every embedder's
+  // traffic, so unset means off
+  private static final boolean LOCAL_FIRST_TX = "true".equals(System.getProperty("org.hl7.fhir.tx.localFirst"));
 
   private static final String UCUM_SYSTEM = "http://unitsofmeasure.org";
   private static final String MIMETYPES_SYSTEM = "urn:ietf:bcp:13";
@@ -2379,6 +2405,11 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       return null;
     }
     if (!code.hasSystem() || !code.hasCode() || code.hasVersion()) {
+      return null;
+    }
+    if (fetchCodeSystem(code.getSystem(), ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) != null) {
+      // a locally loaded CodeSystem (e.g. an IG-supplied fragment with curated displays) must keep
+      // winning via the local validator, exactly as maybeRecordServerUnknownSystem guards
       return null;
     }
     String system = code.getSystem();
@@ -2493,8 +2524,19 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
    * byte-identical to the server's canonical answer by construction, so the pack entry a recording
    * run writes for a suppressed token is the same one an un-suppressed round trip would have written.
    */
+  /**
+   * Memo key for server-confirmed unknown systems: the (system, value set) PAIR, not the system
+   * alone. The server's answer can depend on the value set (a compose that enumerates concepts of
+   * an unknown system can be affirmed without the CodeSystem) and on routing (findRelevantSystems
+   * includes other systems the vs references, which can select a non-master server), so synthesis
+   * only ever replays a (system, vs) combination whose canonical template was actually observed.
+   */
+  private String unknownSystemMemoKey(Coding code, ValueSet vs) {
+    return code.getSystem() + "||" + vs.getVersionedUrl();
+  }
+
   private ValidationResult synthesizeUnknownSystemResult(ValidationOptions options, Coding code, ValueSet vs, String localError) {
-    if (!unknownSynthGate(options, code, vs, localError) || !serverConfirmedUnknownSystems.contains(code.getSystem())) {
+    if (!unknownSynthGate(options, code, vs, localError) || !serverConfirmedUnknownSystems.contains(unknownSystemMemoKey(code, vs))) {
       return null;
     }
     String server = masterServerAddress();
@@ -2521,7 +2563,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (res == null || res.isOk() || !unknownSynthGate(options, code, vs, localError)) {
       return;
     }
-    if (serverConfirmedUnknownSystems.contains(code.getSystem())) {
+    if (serverConfirmedUnknownSystems.contains(unknownSystemMemoKey(code, vs))) {
       return;
     }
     if (res.getSeverity() != IssueSeverity.ERROR || res.getErrorClass() != TerminologyServiceErrorClass.UNKNOWN) {
@@ -2550,7 +2592,7 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
     if (fetchCodeSystem(code.getSystem(), ExtensionUtilities.getVersionResolutionRules(code.getSystemElement())) != null) {
       return;
     }
-    serverConfirmedUnknownSystems.add(code.getSystem());
+    serverConfirmedUnknownSystems.add(unknownSystemMemoKey(code, vs));
   }
 
   private void setTerminologyOptions(ValidationOptions options, Parameters pIn) {

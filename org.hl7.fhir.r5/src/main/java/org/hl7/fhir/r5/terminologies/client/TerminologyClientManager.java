@@ -350,7 +350,13 @@ public class TerminologyClientManager {
    * probe (and a hermetic run doesn't trip on one), matching the live-run decision path exactly.
    */
   private boolean isPackDescribedServer(String s) {
-    return cache != null && cache.getPackCapabilityStatement(s) != null;
+    // only the MASTER's recorded stand-in gets isTxFhirOrg-style blanket trust (matching the
+    // javadoc and the live decision path it mirrors). Packs can carry capability pages for
+    // non-master candidates the live run probed and possibly REJECTED - those must keep going
+    // through checkCSAvailable, which correctly fails closed under hermetic
+    return cache != null && getMasterClient() != null && s != null
+        && s.equals(getMasterClient().getAddress())
+        && cache.getPackCapabilityStatement(s) != null;
   }
 
   private boolean isTxFhirOrg(String s) {
@@ -423,7 +429,9 @@ public class TerminologyClientManager {
   private ServerOptionList findServerForSystem(String s, boolean expand) throws TerminologyServiceException {
     ServerOptionList packList = packResMap.get(s);
     if (packList != null) {
-      return packList;
+      // defensive copy: chooseServer mutates the returned list in place (checkActuallySupports
+      // removeIf), and the pack entries are shared read-only across every manager copy()
+      return new ServerOptionList(packList.url, packList.authoritative, packList.candidates);
     }
     ServerOptionList serverList = resMap.get(s);
     if (serverList == null) {

@@ -1173,8 +1173,18 @@ public class TerminologyCache {
    * Parses one cache page (the on-disk .cache file format: entries separated by {@link #ENTRY_MARKER},
    * request and response separated by {@link #BREAK}) into CacheEntry objects.
    */
-  private List<CacheEntry> parseCachePage(String src) throws IOException {
-    List<CacheEntry> results = new ArrayList<>();
+  private interface CacheEntryConsumer {
+    void accept(CacheEntry e) throws IOException;
+  }
+
+  /**
+   * Parses a cache page, handing each entry to the consumer AS IT IS PARSED. The mutable loader
+   * relies on this incremental contract for corruption recovery: a corrupt entry at position N must
+   * leave entries 1..N-1 already delivered, exactly as the pre-refactor loader behaved. The pack
+   * loader wraps this in all-or-nothing semantics of its own (a corrupt pack is a hard error).
+   */
+  private int parseCachePage(String src, CacheEntryConsumer consumer) throws IOException {
+    int c = 0;
     if (src.startsWith("?"))
       src = src.substring(1);
     int i = src.indexOf(ENTRY_MARKER);
@@ -1186,14 +1196,21 @@ public class TerminologyCache {
         int j = s.indexOf(BREAK);
         String request = s.substring(0, j);
         String p = s.substring(j + BREAK.length() + 1).trim();
-        results.add(getCacheEntry(request, p));
+        consumer.accept(getCacheEntry(request, p));
+        c++;
       }
     }
+    return c;
+  }
+
+  private List<CacheEntry> parseCachePage(String src) throws IOException {
+    List<CacheEntry> results = new ArrayList<>();
+    parseCachePage(src, results::add);
     return results;
   }
 
   private void loadNamedCache(String fn) throws IOException {
-    int c = 0;
+    int[] c = new int[1];
     try {
       String src = FileUtilities.fileToString(Utilities.path(folder, fn));
       String title = fn.substring(0, fn.lastIndexOf("."));
@@ -1202,13 +1219,15 @@ public class TerminologyCache {
       nc.name = title;
       caches.put(nc.name, nc);
 
-      for (CacheEntry cacheEntry : parseCachePage(src)) {
-        c++;
+      // incremental on purpose: a corrupt entry keeps every entry parsed before it, both in memory
+      // and (because nc.list holds them) across the next save() of this page
+      parseCachePage(src, cacheEntry -> {
         nc.map.put(cacheKeyFor(cacheEntry.request), cacheEntry);
         nc.list.add(cacheEntry);
-      }
+        c[0]++;
+      });
     } catch (Exception e) {
-      log.error("Error loading "+fn+": "+e.getMessage()+" entry "+c+" - ignoring it", e);
+      log.error("Error loading "+fn+": "+e.getMessage()+" entry "+c[0]+" - ignoring the remainder of the page", e);
     }
   }
 
@@ -1492,6 +1511,11 @@ public class TerminologyCache {
   }
 
   /** verification hook: true if the pack seed layer holds an entry for this canonical request under the given cache name */
+  /** true when an answer pack is loaded as the read-only seed layer (-Dorg.hl7.fhir.tx.pack=) */
+  public boolean hasPackLoaded() {
+    return !packCaches.isEmpty();
+  }
+
   public boolean packContains(String name, String request) {
     Map<String, CacheEntry> m = packCaches.get(name == null ? "null" : name);
     return m != null && m.containsKey(cacheKeyFor(request));
@@ -1514,8 +1538,10 @@ public class TerminologyCache {
       o.addProperty("request", cacheToken.request);
       byte[] line = (o.toString()+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
       synchronized (missLogLock) {
-        java.nio.file.Files.write(java.nio.file.Paths.get(missLogPath), line,
-            java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        // append via the ManagedFileAccess choke point (SECURITY.md), not raw java.nio
+        try (java.io.FileOutputStream fs = new java.io.FileOutputStream(ManagedFileAccess.file(missLogPath), true)) {
+          fs.write(line);
+        }
       }
     } catch (IOException e) {
       log.error("Unable to append to terminology miss log "+missLogPath+": "+e.getMessage());
@@ -1691,12 +1717,27 @@ public class TerminologyCache {
   }
 
   /**
-   * The canonical cache/pack key for a canonical request JSON: the hash of its canonicalized text.
-   * This is the single key-derivation function used by token generation, mutable cache load and
-   * pack load, so build-time and lookup-time keys can never disagree.
+   * Canonical keys are only used when the pack machinery is in play (a pack seed layer configured,
+   * or a recording run). Default runs keep the stock key derivation: canonicalization changes the
+   * key of every request that carries a profile-url/cache-id, which would silently invalidate the
+   * existing on-disk caches of every user the moment they upgraded.
+   */
+  private static boolean canonicalKeysActive() {
+    return recordSemanticErrors || System.getProperty(PACK_SYSTEM_PROPERTY) != null;
+  }
+
+  /** the canonical (post-canonicalization) key - what packs are built and looked up with */
+  public static String canonicalKeyFor(String request) {
+    return hashNormalized(canonicalizeRequest(request));
+  }
+
+  /**
+   * The cache/pack key for a canonical request JSON. This is the single key-derivation function
+   * used by token generation, mutable cache load and pack load, so build-time and lookup-time keys
+   * can never disagree: canonical when the pack machinery is active, stock otherwise.
    */
   public static String cacheKeyFor(String request) {
-    return hashNormalized(canonicalizeRequest(request));
+    return canonicalKeysActive() ? canonicalKeyFor(request) : hashNormalized(request);
   }
 
   // management

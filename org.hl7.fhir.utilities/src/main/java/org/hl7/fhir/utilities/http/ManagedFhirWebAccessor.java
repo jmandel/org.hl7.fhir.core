@@ -70,9 +70,11 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
    * (floor 2) and the request is retried only after a backoff. Every 50 consecutive successful
    * responses creep the permit count back up by 1, up to the max.
    * <p/>
-   * Enabled by {@code org.hl7.fhir.tx.adaptiveConcurrency=true|false}; default is true when
-   * {@code org.hl7.fhir.tx.maxConcurrency} is not explicitly set, otherwise the explicit static
-   * value is honored (adaptive off) unless adaptiveConcurrency is explicitly true.
+   * Strictly opt-in via {@code org.hl7.fhir.tx.adaptiveConcurrency=true}: 404 is a routine FHIR
+   * outcome on non-tx traffic through this accessor, so treating it as a load-shedding signal (and
+   * paying retry backoffs for it) must never be a default. When the property is unset or not
+   * "true", the static fair semaphore (default 4, or {@code org.hl7.fhir.tx.maxConcurrency})
+   * governs, exactly as before this class existed.
    */
   static class AdaptiveThrottle {
     private final int maxPermits;
@@ -160,17 +162,12 @@ public class ManagedFhirWebAccessor extends ManagedWebAccessorBase<ManagedFhirWe
   private static final AdaptiveThrottle ADAPTIVE_THROTTLE = initAdaptiveThrottle();
 
   private static AdaptiveThrottle initAdaptiveThrottle() {
-    Integer configuredMax = configuredMaxConcurrency();
-    String prop = System.getProperty("org.hl7.fhir.tx.adaptiveConcurrency");
-    boolean adaptive;
-    if (prop != null) {
-      adaptive = "true".equals(prop.trim());
-    } else {
-      adaptive = configuredMax == null;
-    }
-    if (!adaptive) {
+    // opt-in only: see the AdaptiveThrottle javadoc - the 404-as-load-shedding heuristic and the
+    // wider initial concurrency are wrong defaults for general FHIR HTTP traffic
+    if (!"true".equals(System.getProperty("org.hl7.fhir.tx.adaptiveConcurrency", "").trim())) {
       return null;
     }
+    Integer configuredMax = configuredMaxConcurrency();
     return new AdaptiveThrottle(configuredMax == null ? 64 : configuredMax);
   }
 
