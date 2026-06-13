@@ -3,7 +3,6 @@ package org.hl7.fhir.utilities.http;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -93,7 +92,10 @@ public class SimpleHTTPClient {
           if (location == null) {
             throw new IOException("Location header missing in " + connection.getResponseCode() + " redirect");
           }
-          location = URLDecoder.decode(location, StandardCharsets.UTF_8);
+          // the Location header is used AS-IS: percent-decoding it corrupts redirect targets
+          // whose query strings carry encoded data - notably signed URLs (GitHub release
+          // assets redirect to S3 URLs whose AWS signature parameters contain %2F etc.;
+          // decoding them makes the signature invalid and the server answers 400)
 
           url = new URL(originalUrl, location);  // Deal with relative URLs
           continue;
