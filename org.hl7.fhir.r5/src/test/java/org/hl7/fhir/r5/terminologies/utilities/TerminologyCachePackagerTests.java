@@ -39,7 +39,10 @@ import org.junit.jupiter.api.Test;
  *       yields an identical ValidationResult (verified field-wise AND by byte-identical
  *       re-persistence);</li>
  *   <li>capability artifacts (CapabilityStatement / TerminologyCapabilities / servers.ini) flowing
- *       from a cache dir through the packager into the pack seed layer.</li>
+ *       from a cache dir through the packager into the pack seed layer;</li>
+ *   <li>the canonical pack diff ({@code TerminologyCachePackager diff}): volatile fields
+ *       (step timings, expansion ids/timestamps) normalized away, dir/zip equivalence, real
+ *       changes reported.</li>
  * </ul>
  */
 class TerminologyCachePackagerTests {
@@ -489,6 +492,85 @@ class TerminologyCachePackagerTests {
             "merged pack must carry '" + fn.getAsString() + "' referenced by '" + e.getKey() + "'");
       }
     }
+  }
+
+  /** a synthetic answer page in the on-disk format (entries between markers, request #### response) */
+  private static String syntheticPage(String... requestResponsePairs) {
+    StringBuilder b = new StringBuilder(TerminologyCache.ENTRY_MARKER).append("\r");
+    for (int i = 0; i < requestResponsePairs.length; i += 2) {
+      b.append("\n").append(requestResponsePairs[i]).append("\n").append(TerminologyCache.BREAK).append("\n")
+          .append(requestResponsePairs[i + 1]).append("\n").append(TerminologyCache.ENTRY_MARKER).append("\r");
+    }
+    return b.append("\n").toString();
+  }
+
+  private static Path syntheticPack(String label, String pageContent) throws IOException {
+    Path pack = tempDir(label);
+    Files.write(pack.resolve("validation.cache"), pageContent.getBytes(StandardCharsets.UTF_8));
+    return pack;
+  }
+
+  @Test
+  void diffSelfComparesCanonicallyIdentical() throws IOException {
+    Path pack = syntheticPack("txdiff-self", syntheticPage(
+        "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1234-5\"}}", "v: {\"result\" : true}",
+        "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"5678-9\"}}", "v: {\"result\" : false}"));
+    TerminologyCachePackager.DiffResult r = TerminologyCachePackager.diffPacks(pack.toString(), pack.toString());
+    assertTrue(r.isIdentical(), "a pack must compare canonically identical to itself");
+    assertTrue(r.added.isEmpty() && r.removed.isEmpty() && r.changed.isEmpty());
+    assertTrue(r.renderMarkdown().contains("canonically identical"));
+  }
+
+  @Test
+  void diffNormalizesVolatileFieldsAway() throws IOException {
+    // the same logical entry from two recordings: step timings, expansion uuid and timestamps differ
+    // in both the request key and the response value
+    Path oldPack = syntheticPack("txdiff-volatile-old", syntheticPage(
+        "{\"url\" : \"http://x/vs\", \"date\" : \"2026-01-01T00:00:00Z\"}",
+        "e: {\"identifier\" : \"urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000\","
+            + " \"timestamp\" : \"2026-01-02T03:04:05.123Z\", \"diagnostics\" : \"lookup took 12ms total\"}"));
+    Path newPack = syntheticPack("txdiff-volatile-new", syntheticPage(
+        "{\"url\" : \"http://x/vs\", \"date\" : \"2026-05-05T05:05:05+10:00\"}",
+        "e: {\"identifier\" : \"urn:uuid:11111111-2222-3333-4444-555566667777\","
+            + " \"timestamp\" : \"2026-02-03T04:05:06Z\", \"diagnostics\" : \"lookup took 7ms total\"}"));
+    TerminologyCachePackager.DiffResult r = TerminologyCachePackager.diffPacks(oldPack.toString(), newPack.toString());
+    assertTrue(r.isIdentical(), "volatile-only differences must compare canonically identical");
+  }
+
+  @Test
+  void diffReportsRealResponseChange() throws IOException {
+    String request = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1234-5\"}}";
+    Path oldPack = syntheticPack("txdiff-change-old", syntheticPage(request, "v: {\"result\" : true}"));
+    Path newPack = syntheticPack("txdiff-change-new", syntheticPage(request, "v: {\"result\" : false}"));
+    TerminologyCachePackager.DiffResult r = TerminologyCachePackager.diffPacks(oldPack.toString(), newPack.toString());
+    assertFalse(r.isIdentical());
+    assertEquals(1, r.changed.size(), "a real response change must be reported as changed");
+    assertEquals(0, r.added.size());
+    assertEquals(0, r.removed.size());
+    assertEquals("validation.cache", r.changed.get(0).page);
+    String md = r.renderMarkdown();
+    assertTrue(md.contains("| changed | 1 |"));
+    assertTrue(md.contains("**validation.cache**"));
+    assertTrue(md.contains("was: `v: {\"result\" : true}`"));
+    assertTrue(md.contains("now: `v: {\"result\" : false}`"));
+  }
+
+  @Test
+  void diffDirVersusZipOfEquivalentContentComparesIdentical() throws IOException {
+    String page = syntheticPage(
+        "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1234-5\"}}", "v: {\"result\" : true}");
+    Path dirPack = syntheticPack("txdiff-dir", page);
+    // the zip carries the same page CRLF-encoded under a nested path: base-name mapping and
+    // CRLF normalization must make it compare identical to the LF directory read
+    Path zipDir = tempDir("txdiff-zip");
+    File zip = zipDir.resolve("pack.zip").toFile();
+    try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(Files.newOutputStream(zip.toPath()))) {
+      zos.putNextEntry(new java.util.zip.ZipEntry("txpack-x/validation.cache"));
+      zos.write(page.replace("\r", "").replace("\n", "\r\n").getBytes(StandardCharsets.UTF_8));
+      zos.closeEntry();
+    }
+    TerminologyCachePackager.DiffResult r = TerminologyCachePackager.diffPacks(dirPack.toString(), zip.getAbsolutePath());
+    assertTrue(r.isIdentical(), "dir and zip of equivalent content must compare canonically identical");
   }
 
   @Test

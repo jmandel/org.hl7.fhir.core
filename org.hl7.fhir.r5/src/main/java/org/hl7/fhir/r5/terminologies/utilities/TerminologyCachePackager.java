@@ -76,7 +76,11 @@ import com.google.gson.JsonObject;
  *   java ... TerminologyCachePackager build  &lt;sourceCacheDir&gt; &lt;outputParentDir&gt;
  *   java ... TerminologyCachePackager merge  &lt;sourceCacheDir1&gt; &lt;sourceCacheDir2&gt; [...] &lt;outputParentDir&gt;
  *   java ... TerminologyCachePackager verify &lt;packDirOrZip&gt; [sampleCount]
+ *   java ... TerminologyCachePackager diff   &lt;oldPackDirOrZip&gt; &lt;newPackDirOrZip&gt;
  * </pre>
+ * {@code diff} compares two packs canonically (volatile fields normalized away: server step
+ * timings, expansion identifiers/timestamps - see {@link #diffPacks}); exit 0 means canonically
+ * identical, exit 3 means real differences (markdown summary on stdout).
  */
 public class TerminologyCachePackager {
 
@@ -920,6 +924,189 @@ public class TerminologyCachePackager {
     return checked > 0 && found == checked;
   }
 
+  /**
+   * The volatile content packs legitimately differ in even when nothing semantic changed
+   * (empirically derived by diffing two recordings of the same server): millisecond step-timings
+   * inside diagnostics strings, expansion.identifier UUIDs, and expansion.timestamp values. Pack
+   * IDENTITY stays the raw content hash ({@code txpack-<sha256>}); pack EQUALITY for refresh
+   * decisions is the canonical comparison {@link #diffPacks} makes after normalizing these away,
+   * so a re-recording that changed nothing semantic reports "no change" and a refresh job keeps
+   * the old pack.
+   */
+  private static final java.util.regex.Pattern[] VOLATILE_PATTERNS = {
+      java.util.regex.Pattern.compile("\\b\\d+ms "),                     // server step timings in diagnostics
+      java.util.regex.Pattern.compile("urn:uuid:[0-9a-f-]{36}"),         // expansion identifiers
+      java.util.regex.Pattern.compile("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2})?"),
+  };
+  private static final String[] VOLATILE_REPLACEMENTS = { "Nms ", "urn:uuid:X", "TS" };
+
+  /** CRLF-normalizes (zip reads preserve CRLF where dir text reads translate it) and blanks the volatile fields */
+  private static String canonicalize(String text) {
+    text = text.replace("\r\n", "\n");
+    for (int i = 0; i < VOLATILE_PATTERNS.length; i++) {
+      text = VOLATILE_PATTERNS[i].matcher(text).replaceAll(VOLATILE_REPLACEMENTS[i]);
+    }
+    return text;
+  }
+
+  /** one added/removed/changed answer in a {@link DiffResult}; was/now are null except for changed entries */
+  public static class DiffEntry {
+    public final String page;
+    public final String request;  // canonical form
+    public final String was;      // canonical old response (changed entries only)
+    public final String now;      // canonical new response (changed entries only)
+    DiffEntry(String page, String request, String was, String now) {
+      this.page = page;
+      this.request = request;
+      this.was = was;
+      this.now = now;
+    }
+  }
+
+  /** outcome of {@link #diffPacks}: the canonical differences between two packs */
+  public static class DiffResult {
+    public final List<DiffEntry> added = new ArrayList<>();
+    public final List<DiffEntry> removed = new ArrayList<>();
+    public final List<DiffEntry> changed = new ArrayList<>();
+
+    public boolean isIdentical() {
+      return added.isEmpty() && removed.isEmpty() && changed.isEmpty();
+    }
+
+    /** the one-liner for the identical case, or the markdown change summary */
+    public String renderMarkdown() {
+      if (isIdentical()) {
+        return "canonically identical (volatile fields normalized: step timings, expansion ids/timestamps)\n";
+      }
+      StringBuilder b = new StringBuilder();
+      b.append("## Answer pack changes\n\n");
+      b.append("| | count |\n|---|---|\n");
+      b.append("| added | ").append(added.size()).append(" |\n");
+      b.append("| removed | ").append(removed.size()).append(" |\n");
+      b.append("| changed | ").append(changed.size()).append(" |\n");
+      if (!changed.isEmpty()) {
+        b.append("\n### Changed answers (the part that needs review)\n\n");
+        for (DiffEntry e : changed.subList(0, Math.min(25, changed.size()))) {
+          b.append("- **").append(e.page).append("**: `").append(head(e.request)).append("`\n");
+          b.append("  - was: `").append(head(e.was)).append("`\n");
+          b.append("  - now: `").append(head(e.now)).append("`\n");
+        }
+        if (changed.size() > 25) {
+          b.append("- ... and ").append(changed.size() - 25).append(" more\n");
+        }
+      }
+      appendSimpleSection(b, "Added", added);
+      appendSimpleSection(b, "Removed", removed);
+      return b.toString();
+    }
+
+    private static void appendSimpleSection(StringBuilder b, String title, List<DiffEntry> entries) {
+      if (entries.isEmpty()) {
+        return;
+      }
+      b.append("\n### ").append(title).append("\n\n");
+      for (DiffEntry e : entries.subList(0, Math.min(15, entries.size()))) {
+        b.append("- ").append(e.page).append(": `").append(head(e.request)).append("`\n");
+      }
+      if (entries.size() > 15) {
+        b.append("- ... and ").append(entries.size() - 15).append(" more\n");
+      }
+    }
+
+    /** whitespace-collapsed first 140 chars, so requests/responses render as one-line code spans */
+    private static String head(String s) {
+      String collapsed = s.trim().replaceAll("\\s+", " ");
+      return collapsed.length() > 140 ? collapsed.substring(0, 140) : collapsed;
+    }
+  }
+
+  /**
+   * Canonical comparison of two packs (directories or zips): every answer page's entries, with the
+   * volatile fields normalized away (see {@link #canonicalize}) on BOTH the request keys and the
+   * response values, so two recordings of the same server content compare identical even though
+   * their raw bytes (and so their sha256 pack names) differ.
+   */
+  public static DiffResult diffPacks(String oldPack, String newPack) throws IOException {
+    Map<String, Map<String, String>> oldPages = loadCanonicalPages(oldPack);
+    Map<String, Map<String, String>> newPages = loadCanonicalPages(newPack);
+    DiffResult res = new DiffResult();
+    TreeSet<String> pageNames = new TreeSet<>(oldPages.keySet());
+    pageNames.addAll(newPages.keySet());
+    for (String page : pageNames) {
+      Map<String, String> o = oldPages.getOrDefault(page, java.util.Collections.emptyMap());
+      Map<String, String> n = newPages.getOrDefault(page, java.util.Collections.emptyMap());
+      for (Map.Entry<String, String> e : new TreeMap<>(n).entrySet()) {
+        if (!o.containsKey(e.getKey())) {
+          res.added.add(new DiffEntry(page, e.getKey(), null, null));
+        } else if (!o.get(e.getKey()).equals(e.getValue())) {
+          res.changed.add(new DiffEntry(page, e.getKey(), o.get(e.getKey()), e.getValue()));
+        }
+      }
+      for (String req : new TreeMap<>(o).keySet()) {
+        if (!n.containsKey(req)) {
+          res.removed.add(new DiffEntry(page, req, null, null));
+        }
+      }
+    }
+    return res;
+  }
+
+  /** page file name -> (canonical request -> canonical response), from a pack dir or zip */
+  private static Map<String, Map<String, String>> loadCanonicalPages(String pack) throws IOException {
+    File f = ManagedFileAccess.file(pack);
+    Map<String, Map<String, String>> pages = new TreeMap<>();
+    if (f.isDirectory()) {
+      String[] names = f.list();
+      if (names == null) {
+        throw new IOException("Unable to list pack directory: "+pack);
+      }
+      java.util.Arrays.sort(names);
+      for (String fn : names) {
+        File pf = ManagedFileAccess.file(f, fn);
+        if (pf.isFile() && isAnswerPage(fn)) {
+          pages.put(fn, parseCanonicalEntries(FileUtilities.fileToString(pf)));
+        }
+      }
+    } else if (f.isFile()) {
+      try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(f)) {
+        java.util.Enumeration<? extends java.util.zip.ZipEntry> en = zf.entries();
+        while (en.hasMoreElements()) {
+          java.util.zip.ZipEntry ze = en.nextElement();
+          String base = ze.getName().substring(ze.getName().lastIndexOf('/') + 1);
+          if (!ze.isDirectory() && isAnswerPage(base)) {
+            pages.put(base, parseCanonicalEntries(new String(zf.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8)));
+          }
+        }
+      }
+    } else {
+      throw new IOException("Pack not found: "+pack);
+    }
+    return pages;
+  }
+
+  private static boolean isAnswerPage(String fn) {
+    return fn.endsWith(TerminologyCache.CACHE_FILE_EXTENSION) && !fn.startsWith(".");
+  }
+
+  /**
+   * Lenient page parse for comparison (unlike the byte-faithful {@link #parsePage}, which packaging
+   * needs): chunks between entry markers, request/response split on the first break; chunks without
+   * a break (e.g. the empty head/tail of the marker split) are skipped, not errors.
+   */
+  private static Map<String, String> parseCanonicalEntries(String text) {
+    Map<String, String> entries = new LinkedHashMap<>();
+    for (String chunk : text.split(java.util.regex.Pattern.quote(TerminologyCache.ENTRY_MARKER), -1)) {
+      chunk = chunk.trim();
+      int j = chunk.indexOf(TerminologyCache.BREAK);
+      if (chunk.isEmpty() || j < 0) {
+        continue;
+      }
+      entries.put(canonicalize(chunk.substring(0, j).trim()),
+          canonicalize(chunk.substring(j + TerminologyCache.BREAK.length()).trim()));
+    }
+    return entries;
+  }
+
   public static void main(String[] args) throws Exception {
     if (args.length >= 3 && "build".equals(args[0])) {
       BuildResult r = build(args[1], args[2]);
@@ -945,11 +1132,22 @@ public class TerminologyCachePackager {
       if (!ok) {
         System.exit(1);
       }
+    } else if (args.length >= 3 && "diff".equals(args[0])) {
+      DiffResult r = diffPacks(args[1], args[2]);
+      System.out.print(r.renderMarkdown());
+      if (!r.isIdentical()) {
+        System.exit(3);
+      }
     } else {
       System.out.println("Usage:");
       System.out.println("  TerminologyCachePackager build <sourceCacheDir> <outputParentDir>");
       System.out.println("  TerminologyCachePackager merge <sourceCacheDir1> <sourceCacheDir2> [...] <outputParentDir>");
       System.out.println("  TerminologyCachePackager verify <packDirOrZip> [sampleCount]");
+      System.out.println("  TerminologyCachePackager diff   <oldPackDirOrZip> <newPackDirOrZip>");
+      System.out.println("      canonical comparison (volatile fields normalized: step timings, expansion");
+      System.out.println("      ids/timestamps); exit 0 = canonically identical, exit 3 = real differences");
+      System.out.println("      (markdown summary on stdout) - for refresh jobs deciding whether a");
+      System.out.println("      re-recording actually changed anything");
       System.out.println();
       System.out.println("Recording a complete pack (one that also serves hermetic runs, -Dorg.hl7.fhir.tx.hermetic=true):");
       System.out.println("  1. run the build/validation COLD (empty tx cache dir) with:");
