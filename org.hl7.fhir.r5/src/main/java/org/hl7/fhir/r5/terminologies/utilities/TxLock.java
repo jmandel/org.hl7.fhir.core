@@ -15,20 +15,24 @@ import org.hl7.fhir.utilities.http.ManagedWebAccess;
 import com.google.gson.JsonObject;
 
 /**
- * Resolver for a repo-committed {@code tx.lock} file: the ~1KB pointer that pins the immutable
- * terminology answer pack (see {@link TerminologyCachePackager}) a checkout builds against.
+ * Resolver for a repo-committed {@code fhir.lock} file: the content lock that pins the FHIR
+ * package dependencies a checkout builds against - first among them the immutable terminology
+ * answer pack (see {@link TerminologyCachePackager}).
  * <p/>
- * The lock names the pack by content hash and fetch URL. Resolution is content-addressed:
- * the pack zip lives at {@code ~/.fhir/tx-packs/<sha256>.zip}, is verified against its hash on
- * every use (a corrupt or tampered file is deleted and refetched once), and is never mutated.
- * Builds driven by a lock therefore need no terminology server and no mutable per-machine
- * cache state for any answer the pack carries; misses fall through to the network exactly as
- * without a pack.
+ * The lock is a profile of npm's package-lock v3 shape, chosen so no new format exists to
+ * specify or learn: a {@code packages} map of package name to {@code {version, resolved,
+ * integrity}}, where {@code integrity} is an SSRI string ({@code sha256-<base64>}). Two
+ * deliberate divergences from npm: keys are plain package names (no {@code node_modules/}
+ * vendor-path prefix - entries resolve into the shared content-addressed store, never a
+ * per-project folder), and a top-level {@code expectedOutput} member records the build output
+ * signature this content produces, because it changes in the same single-writer commit as the
+ * pack it describes.
  * <p/>
- * Lock format (JSON): {@code {"pack": {"zipSha256": "<64 hex>", "url": "https://..."}}} -
- * other members are informational. The expected output signature, when present
- * ({@code {"expectedSignature": {"errors": N, "warnings": N, "information": N}}}), can be read
- * with {@link #expectedSignature(String)} by drivers that want to assert it.
+ * Registries FIND bytes ({@code resolved}); the lock TRUSTS bytes ({@code integrity}, verified
+ * on every use); the store KEEPS bytes ({@code ~/.fhir/tx-packs/<sha256>.zip}, immutable -
+ * a corrupt or tampered entry is deleted and refetched once). Builds driven by a lock need no
+ * terminology server for any answer the pack carries; misses fall through to the network
+ * exactly as without a pack.
  */
 public class TxLock {
 
@@ -42,12 +46,9 @@ public class TxLock {
    */
   public static String resolvePackPath(String lockFilePath) throws IOException {
     JsonObject lock = parse(lockFilePath);
-    JsonObject pack = member(lock, lockFilePath, "pack");
-    String sha = string(pack, lockFilePath, "zipSha256");
-    String url = string(pack, lockFilePath, "url");
-    if (!sha.matches("[0-9a-f]{64}")) {
-      throw new IOException("tx.lock pack.zipSha256 is not a sha256 hex string: " + lockFilePath);
-    }
+    JsonObject pack = findTxPack(lock, lockFilePath);
+    String url = string(pack, lockFilePath, "resolved");
+    String sha = sha256FromIntegrity(string(pack, lockFilePath, "integrity"), lockFilePath);
     File store = ManagedFileAccess.file(Utilities.path(System.getProperty("user.home"), ".fhir", "tx-packs"));
     FileUtilities.createDirectory(store.getAbsolutePath());
     File cached = ManagedFileAccess.file(store, sha + ".zip");
@@ -69,7 +70,7 @@ public class TxLock {
     }
     if (!sha.equals(sha256(part))) {
       part.delete();
-      throw new IOException("Downloaded terminology pack does not match tx.lock pack.zipSha256 (" + url + ")");
+      throw new IOException("Downloaded terminology pack does not match fhir.lock integrity (" + url + ")");
     }
     if (!part.renameTo(cached)) {
       throw new IOException("Unable to install terminology pack into store: " + cached);
@@ -80,11 +81,43 @@ public class TxLock {
   /** the lock's expected output signature as {errors, warnings, information}, or null when absent */
   public static int[] expectedSignature(String lockFilePath) throws IOException {
     JsonObject lock = parse(lockFilePath);
-    if (!lock.has("expectedSignature")) {
+    if (!lock.has("expectedOutput")) {
       return null;
     }
-    JsonObject sig = lock.getAsJsonObject("expectedSignature");
+    JsonObject sig = lock.getAsJsonObject("expectedOutput");
     return new int[] { sig.get("errors").getAsInt(), sig.get("warnings").getAsInt(), sig.get("information").getAsInt() };
+  }
+
+  /** the terminology answer pack entry: the package whose name ends ".txpack" */
+  private static JsonObject findTxPack(JsonObject lock, String lockFilePath) throws IOException {
+    JsonObject packages = member(lock, lockFilePath, "packages");
+    for (String name : packages.keySet()) {
+      if (name.endsWith(".txpack") && packages.get(name).isJsonObject()) {
+        return packages.getAsJsonObject(name);
+      }
+    }
+    throw new IOException("fhir.lock has no *.txpack entry in 'packages': " + lockFilePath);
+  }
+
+  /** SSRI "sha256-<base64>" -> lowercase hex */
+  private static String sha256FromIntegrity(String integrity, String lockFilePath) throws IOException {
+    if (!integrity.startsWith("sha256-")) {
+      throw new IOException("fhir.lock integrity is not sha256 SSRI: " + lockFilePath);
+    }
+    byte[] raw;
+    try {
+      raw = java.util.Base64.getDecoder().decode(integrity.substring("sha256-".length()));
+    } catch (IllegalArgumentException e) {
+      throw new IOException("fhir.lock integrity is not valid base64: " + lockFilePath);
+    }
+    if (raw.length != 32) {
+      throw new IOException("fhir.lock integrity is not a sha256 digest: " + lockFilePath);
+    }
+    StringBuilder b = new StringBuilder();
+    for (byte x : raw) {
+      b.append(String.format("%02x", x));
+    }
+    return b.toString();
   }
 
   private static JsonObject parse(String lockFilePath) throws IOException {
@@ -94,14 +127,14 @@ public class TxLock {
 
   private static JsonObject member(JsonObject o, String lockFilePath, String name) throws IOException {
     if (!o.has(name) || !o.get(name).isJsonObject()) {
-      throw new IOException("tx.lock has no '" + name + "' object: " + lockFilePath);
+      throw new IOException("fhir.lock has no '" + name + "' object: " + lockFilePath);
     }
     return o.getAsJsonObject(name);
   }
 
   private static String string(JsonObject o, String lockFilePath, String name) throws IOException {
     if (!o.has(name)) {
-      throw new IOException("tx.lock is missing '" + name + "': " + lockFilePath);
+      throw new IOException("fhir.lock is missing '" + name + "': " + lockFilePath);
     }
     return o.get(name).getAsString();
   }

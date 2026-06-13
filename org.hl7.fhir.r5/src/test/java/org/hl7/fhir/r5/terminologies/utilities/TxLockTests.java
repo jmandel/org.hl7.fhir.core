@@ -27,11 +27,20 @@ class TxLockTests {
     return b.toString();
   }
 
+  private String ssri(String hexSha) {
+    byte[] raw = new byte[32];
+    for (int i = 0; i < 32; i++) {
+      raw[i] = (byte) Integer.parseInt(hexSha.substring(i * 2, i * 2 + 2), 16);
+    }
+    return "sha256-" + java.util.Base64.getEncoder().encodeToString(raw);
+  }
+
   private File writeLock(String sha, String url, boolean withSignature) throws IOException {
-    File lock = new File(tmp, "tx.lock");
-    String sig = withSignature ? ",\n  \"expectedSignature\": {\"errors\": 0, \"warnings\": 3693, \"information\": 345}" : "";
-    Files.write(lock.toPath(), ("{\n  \"pack\": {\"zipSha256\": \"" + sha + "\", \"url\": \"" + url + "\"}" + sig + "\n}")
-        .getBytes(StandardCharsets.UTF_8));
+    File lock = new File(tmp, "fhir.lock");
+    String sig = withSignature ? ",\n  \"expectedOutput\": {\"errors\": 0, \"warnings\": 3693, \"information\": 345}" : "";
+    String integrity = sha.matches("[0-9a-f]{64}") ? ssri(sha) : sha; // pass malformed values through for negative tests
+    Files.write(lock.toPath(), ("{\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"hl7.fhir.r6.txpack\": {\"version\": \"20260612\", \"resolved\": \""
+        + url + "\", \"integrity\": \"" + integrity + "\"}\n  }" + sig + "\n}").getBytes(StandardCharsets.UTF_8));
     return lock;
   }
 
@@ -56,18 +65,21 @@ class TxLockTests {
   }
 
   @Test
-  void malformedShaIsRejected() throws Exception {
-    File lock = writeLock("nothex", "https://example.invalid/x.zip", false);
+  void malformedIntegrityIsRejected() throws Exception {
+    File lock = writeLock("sha256-not!!base64", "https://example.invalid/x.zip", false);
     IOException e = assertThrows(IOException.class, () -> TxLock.resolvePackPath(lock.getAbsolutePath()));
-    assertTrue(e.getMessage().contains("zipSha256"));
+    assertTrue(e.getMessage().contains("integrity"));
+    File lock2 = writeLock("md5-abcd", "https://example.invalid/x.zip", false);
+    IOException e2 = assertThrows(IOException.class, () -> TxLock.resolvePackPath(lock2.getAbsolutePath()));
+    assertTrue(e2.getMessage().contains("integrity"));
   }
 
   @Test
-  void missingPackObjectIsRejected() throws Exception {
-    File lock = new File(tmp, "tx.lock");
-    Files.write(lock.toPath(), "{\"tooling\": {}}".getBytes(StandardCharsets.UTF_8));
+  void missingTxpackEntryIsRejected() throws Exception {
+    File lock = new File(tmp, "fhir.lock");
+    Files.write(lock.toPath(), "{\"lockfileVersion\": 3, \"packages\": {\"hl7.terminology\": {\"version\": \"7.1.0\"}}}".getBytes(StandardCharsets.UTF_8));
     IOException e = assertThrows(IOException.class, () -> TxLock.resolvePackPath(lock.getAbsolutePath()));
-    assertTrue(e.getMessage().contains("'pack'"));
+    assertTrue(e.getMessage().contains(".txpack"));
   }
 
   @Test
