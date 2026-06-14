@@ -244,9 +244,11 @@ public class ValueSetExpander extends ValueSetProcessBase {
     if (langs == null) {
       n.setDisplay(display);
     } else {
-      if (designations == null) {
-        designations = new ArrayList<>();
-      }
+      // defensive copy: never mutate the caller's live (often cached, shared) designation list -
+      // appending the synthetic preferredForLanguage entry to the source CodeSystem concept makes
+      // repeated expansions accumulate duplicates, so the designation count flickers with
+      // processing order. Add only to a local copy.
+      designations = designations == null ? new ArrayList<>() : new ArrayList<>(designations);
       designations.add(new ConceptDefinitionDesignationComponent().setLanguage(dispLang).setValue(display).setUse(new Coding().setSystem("http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra").setCode("preferredForLanguage")));
       pref = findMatchingDesignation(designations);
       if (pref != null) {

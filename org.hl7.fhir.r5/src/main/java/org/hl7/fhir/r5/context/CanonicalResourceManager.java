@@ -262,7 +262,7 @@ public class CanonicalResourceManager<T extends CanonicalResource> {
 
   private boolean minimalMemory;
   private boolean enforceUniqueId;
-  private Set<CachedCanonicalResource<T>> allResources = new HashSet<>();
+  private Set<CachedCanonicalResource<T>> allResources = new LinkedHashSet<>(); // insertion-ordered: getList() must be deterministic run-to-run (was identity-hashed HashSet)
   private Map<String, List<CachedCanonicalResource<T>>> listForId;
   private Map<String, List<CachedCanonicalResource<T>>> listForUrl;
   private Map<String, CachedCanonicalResource<T>> indexedResources;
@@ -274,7 +274,7 @@ public class CanonicalResourceManager<T extends CanonicalResource> {
     super();
     this.enforceUniqueId = enforceUniqueId;
     this.minimalMemory = minimalMemory;
-    allResources = new HashSet<>();
+    allResources = new LinkedHashSet<>();
     listForId = new HashMap<>();
     listForUrl = new HashMap<>();
     indexedResources = new HashMap<>();

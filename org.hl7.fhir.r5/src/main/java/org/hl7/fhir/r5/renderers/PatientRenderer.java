@@ -660,7 +660,12 @@ public class PatientRenderer extends ResourceRenderer {
           if (context.isInlineGraphics() || Utilities.noString(context.getDestDir()) || ext == null) {
             td.img("data:"+ct+";base64,"+att.primitiveValue("data"), "patient photo");
           } else {
-            String n = context.getRandomName(r.getId())+ext;
+            // content-derived name (not a per-build random UUID): the same photo always yields
+            // the same file + <img src>, and reruns overwrite rather than leave uncleaned cruft
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(cnt);
+            String n = "patient-photo-" + (r.getId() == null ? "" : r.getId() + "-")
+                + Long.toHexString(crc.getValue()) + ext;
             FileUtilities.bytesToFile(cnt, ManagedFileAccess.file(Utilities.path(context.getDestDir(), n)));
             context.registerFile(n);
             td.img(n, context.formatPhrase(RenderingContext.PAT_PHOTO));            
