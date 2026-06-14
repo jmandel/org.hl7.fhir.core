@@ -259,8 +259,25 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
    * @throws DefinitionException
    * @throws FHIRException
    */
+  // Serializes lazy snapshot generation. Generation mutates the profile's differential AND the shared
+  // base StructureDefinition IN PLACE (ProfileUtilities.sortDifferential clears+refills the
+  // differential; fixTypeOfResourceId edits base element types), so two threads generating snapshots
+  // that share a base race - an intermittent build error under parallel validation (a torn read of a
+  // base element type). A single reentrant lock makes generation atomic without deadlock (recursion
+  // re-enters); the isGeneratedSnapshot() fast-path below keeps already-finished SDs lock-free, so
+  // validation - which only ever reads finished snapshots - is never serialized. Defense-in-depth:
+  // the build also pre-generates all snapshots serially before its parallel phase.
+  private static final Object SNAPSHOT_GEN_LOCK = new Object();
+
   public void generateSnapshot(StructureDefinition p) throws DefinitionException, FHIRException {
-    if ((!p.hasSnapshot() || isProfileNeedsRegenerate(p))) {
+    if (p.isGeneratedSnapshot()) {
+      return; // fully generated (the flag is set last, under the lock) - no lock, no torn read
+    }
+    synchronized (SNAPSHOT_GEN_LOCK) {
+      if (p.isGeneratedSnapshot()) {
+        return; // another thread finished it while we waited for the lock
+      }
+      if ((!p.hasSnapshot() || isProfileNeedsRegenerate(p))) {
       if (!p.hasBaseDefinition())
         throw new DefinitionException(context.formatMessage(I18nConstants.PROFILE___HAS_NO_BASE_AND_NO_SNAPSHOT, p.getName(), p.getUrl()));
       StructureDefinition sd = context.fetchResource(StructureDefinition.class, p.getBaseDefinition(), ExtensionUtilities.getVersionResolutionRules(p.getBaseDefinitionElement()), null, p);
@@ -303,8 +320,9 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
       if (!p.hasSnapshot())
         throw new FHIRException(context.formatMessage(I18nConstants.PROFILE___ERROR_GENERATING_SNAPSHOT, p.getName(), p.getUrl()));
       pu = null;
+      }
+      p.setGeneratedSnapshot(true);
     }
-    p.setGeneratedSnapshot(true);
   }
 
 
