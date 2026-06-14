@@ -140,6 +140,12 @@ public class CodeSystemUtilities extends TerminologyUtilities {
   }
 
   public static final String USER_DATA_CROSS_LINK = "cs.utils.cross.link";
+  // marks a CodeSystem whose concepts have already had cross-link children attached, so a second
+  // crossLinkCodeSystem pass on the same instance is a no-op. Cross-linking ACCUMULATES (each pass
+  // appends every child again), so without this guard a doubly-linked instance emits duplicate
+  // contained codes in expansions - the same shared-mutable-state determinism class as the
+  // designation flicker, made order-independent here by construction.
+  private static final String USER_DATA_CROSS_LINK_DONE = "cs.utils.cross.link.done";
 
   public static class CodeSystemNavigator {
 
@@ -717,10 +723,14 @@ public class CodeSystemUtilities extends TerminologyUtilities {
   }
 
   public static void crossLinkCodeSystem(@Nonnull CodeSystem cs) {
+    if (cs.hasUserData(USER_DATA_CROSS_LINK_DONE)) {
+      return; // already linked: a second pass would duplicate every cross-link child (see constant)
+    }
     String parent = getPropertyByUrl(cs, "http://hl7.org/fhir/concept-properties#parent");
     if ((parent != null)) {
       crossLinkConcepts(cs.getConcept(), cs.getConcept(), parent);
     }
+    cs.setUserData(USER_DATA_CROSS_LINK_DONE, Boolean.TRUE);
   }
 
   private static String getPropertyByUrl(@Nonnull CodeSystem cs, String url) {

@@ -555,6 +555,74 @@ class TerminologyCachePackagerTests {
     assertTrue(md.contains("now: `v: {\"result\" : false}`"));
   }
 
+  // ---- recorder server-nondeterminism defenses: carry-forward + reproduce ----
+
+  @Test
+  void carryForwardKeepsPinnedAnswerWhenFreshRecordingMissesIt() throws IOException {
+    // a transient server failure means the fresh recording lacks an answer the pinned pack has;
+    // merge([pinned, fresh]) (pinned first, fresh wins on overlap) carries the pinned answer
+    // forward so a flake can never become a spurious "removed".
+    String keyA = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1234-5\"}}";
+    String keyB = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"5678-9\"}}";
+    Path pinned = syntheticPack("cf-pinned",
+        syntheticPage(keyA, "v: {\"result\" : true}", keyB, "v: {\"result\" : true}"));
+    Path fresh = syntheticPack("cf-fresh", syntheticPage(keyA, "v: {\"result\" : true}")); // keyB missing (flake)
+    Path out = tempDir("cf-out");
+    TerminologyCachePackager.BuildResult candidate = TerminologyCachePackager.merge(
+        Arrays.asList(pinned.toString(), fresh.toString()), out.toString());
+    TerminologyCachePackager.DiffResult diff = TerminologyCachePackager.diffPacks(pinned.toString(), candidate.packPath);
+    assertTrue(diff.isIdentical(), "a transiently-missing answer must be carried forward, not reported as removed");
+  }
+
+  @Test
+  void reproduceFilterKeepsConfirmedChangeAndDropsUnreproducedFlap() throws IOException {
+    String changed = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1234-5\"}}";
+    String flapped = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"5678-9\"}}";
+    String stable = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"0000-0\"}}";
+    Path pinned = syntheticPack("rf-pinned", syntheticPage(
+        changed, "v: {\"result\" : true}", flapped, "v: {\"result\" : true}", stable, "v: {\"result\" : true}"));
+    // build A: changed flips (real), flapped flips (a load blip), stable unchanged
+    Path freshA = syntheticPack("rf-A", syntheticPage(
+        changed, "v: {\"result\" : false}", flapped, "v: {\"result\" : false}", stable, "v: {\"result\" : true}"));
+    // build B: changed reproduces the flip, flapped reverts (so it does NOT reproduce A), stable unchanged
+    Path freshB = syntheticPack("rf-B", syntheticPage(
+        changed, "v: {\"result\" : false}", flapped, "v: {\"result\" : true}", stable, "v: {\"result\" : true}"));
+    Path filtered = tempDir("rf-filtered");
+    int dropped = TerminologyCachePackager.reproduceFilter(
+        freshA.toString(), freshB.toString(), pinned.toString(), filtered.toString());
+    assertEquals(1, dropped, "only the unreproduced flap is dropped");
+    Path out = tempDir("rf-out");
+    TerminologyCachePackager.BuildResult candidate = TerminologyCachePackager.merge(
+        Arrays.asList(pinned.toString(), filtered.toString()), out.toString());
+    TerminologyCachePackager.DiffResult diff = TerminologyCachePackager.diffPacks(pinned.toString(), candidate.packPath);
+    assertEquals(1, diff.changed.size(), "the reproduced change is proposed");
+    assertEquals(0, diff.added.size());
+    assertEquals(0, diff.removed.size(), "the flap is carried forward from pinned, never proposed as a change");
+  }
+
+  @Test
+  void reproduceFilterConfirmsAdditionsAndDropsUnconfirmedOnes() throws IOException {
+    String existing = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"1111-1\"}}";
+    String addReal = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"2222-2\"}}";
+    String addFlap = "{\"code\" : {\"system\" : \"http://loinc.org\", \"code\" : \"3333-3\"}}";
+    Path pinned = syntheticPack("ra-pinned", syntheticPage(existing, "v: {\"result\" : true}"));
+    Path freshA = syntheticPack("ra-A", syntheticPage(
+        existing, "v: {\"result\" : true}", addReal, "v: {\"result\" : true}", addFlap, "v: {\"result\" : true}"));
+    Path freshB = syntheticPack("ra-B", syntheticPage(
+        existing, "v: {\"result\" : true}", addReal, "v: {\"result\" : true}")); // addFlap not reproduced
+    Path filtered = tempDir("ra-filtered");
+    int dropped = TerminologyCachePackager.reproduceFilter(
+        freshA.toString(), freshB.toString(), pinned.toString(), filtered.toString());
+    assertEquals(1, dropped, "the unconfirmed addition is dropped");
+    Path out = tempDir("ra-out");
+    TerminologyCachePackager.BuildResult candidate = TerminologyCachePackager.merge(
+        Arrays.asList(pinned.toString(), filtered.toString()), out.toString());
+    TerminologyCachePackager.DiffResult diff = TerminologyCachePackager.diffPacks(pinned.toString(), candidate.packPath);
+    assertEquals(1, diff.added.size(), "only the reproduced addition is proposed");
+    assertEquals(0, diff.changed.size());
+    assertEquals(0, diff.removed.size());
+  }
+
   @Test
   void diffDirVersusZipOfEquivalentContentComparesIdentical() throws IOException {
     String page = syntheticPage(

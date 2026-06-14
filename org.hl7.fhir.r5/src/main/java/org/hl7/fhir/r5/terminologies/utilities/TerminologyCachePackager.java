@@ -934,7 +934,7 @@ public class TerminologyCachePackager {
    * the old pack.
    */
   private static final java.util.regex.Pattern[] VOLATILE_PATTERNS = {
-      java.util.regex.Pattern.compile("\\b\\d+ms "),                     // server step timings in diagnostics
+      java.util.regex.Pattern.compile("(?<![0-9])\\d+ms "),             // server step timings in diagnostics (NB: a \b boundary fails here - the timings sit after a JSON-encoded \n, so the char before the digit is a word-char 'n'; a non-digit lookbehind is what actually catches every timing, not just the first)
       java.util.regex.Pattern.compile("urn:uuid:[0-9a-f-]{36}"),         // expansion identifiers
       java.util.regex.Pattern.compile("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2})?"),
   };
@@ -1049,6 +1049,66 @@ public class TerminologyCachePackager {
       }
     }
     return res;
+  }
+
+  /**
+   * Reproduce filter for the recorder's server-nondeterminism defense. Copies a fresh recording
+   * ({@code freshA}) into {@code outDir}, keeping a delta-vs-pinned answer only if a SECOND fresh
+   * recording ({@code freshB}) reproduces it canonically. An unreproduced delta - a changed or added
+   * answer the second recording did not confirm, i.e. server flakiness (overload bailout, a
+   * load-balanced shard, a transient blip) - is dropped, so the downstream carry-forward
+   * {@code merge([pinned, outDir])} falls back to the pinned answer for it. Entries canonically equal
+   * to the pinned pack are always kept (the unchanged common case). Comparison uses the same
+   * {@link #canonicalize} normalization as {@link #diffPacks}, so volatile fields (timestamps,
+   * urn:uuids, step timings) never count as a delta. Returns the number of unreproduced deltas
+   * dropped. Non-answer artifacts (externals, capability pages, servers.ini, system-map) are copied
+   * verbatim so the carry-forward merge can read them.
+   */
+  public static int reproduceFilter(String freshA, String freshB, String pinned, String outDir) throws IOException {
+    Map<String, Map<String, String>> bCanon = loadCanonicalPages(freshB);
+    Map<String, Map<String, String>> pCanon = loadCanonicalPages(pinned);
+    File src = ManagedFileAccess.file(freshA);
+    String[] names = src.list();
+    if (names == null) {
+      throw new IOException("reproduceFilter: not a directory: " + freshA);
+    }
+    FileUtilities.createDirectory(outDir);
+    java.util.Arrays.sort(names);
+    int dropped = 0;
+    for (String fn : names) {
+      File sf = ManagedFileAccess.file(src, fn);
+      if (!sf.isFile()) {
+        continue;
+      }
+      if (!isAnswerPage(fn)) {
+        FileUtilities.copyFile(sf, ManagedFileAccess.file(outDir, fn)); // verbatim: externals, caps, servers.ini, system-map
+        continue;
+      }
+      PageParse page = parsePage(fn, FileUtilities.fileToString(sf));
+      Map<String, String> b = bCanon.getOrDefault(fn, java.util.Collections.emptyMap());
+      Map<String, String> p = pCanon.getOrDefault(fn, java.util.Collections.emptyMap());
+      PackPageWriter w = new PackPageWriter();
+      int kept = 0;
+      for (RawEntry e : page.entries) {
+        if (isPoison(e.response)) {
+          continue;
+        }
+        String cReq = canonicalize(e.request.trim());
+        String aResp = canonicalize(e.response.trim());
+        if (!aResp.equals(p.get(cReq))) {     // a delta vs the pinned pack (changed or added)
+          if (!aResp.equals(b.get(cReq))) {   // the second recording did not reproduce it
+            dropped++;
+            continue;                         // drop -> carry-forward restores the pinned answer
+          }
+        }
+        w.add(e);
+        kept++;
+      }
+      if (kept > 0) {
+        FileUtilities.bytesToFile(w.close().getBytes(StandardCharsets.UTF_8), Utilities.path(outDir, fn));
+      }
+    }
+    return dropped;
   }
 
   /** page file name -> (canonical request -> canonical response), from a pack dir or zip */
