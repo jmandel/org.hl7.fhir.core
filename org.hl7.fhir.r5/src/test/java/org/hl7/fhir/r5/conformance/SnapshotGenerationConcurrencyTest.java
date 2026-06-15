@@ -106,4 +106,68 @@ class SnapshotGenerationConcurrencyTest {
       }
     }
   }
+
+  /**
+   * Regression test for the {@link ContextUtilities#allStructures()} parallel-validation data race.
+   *
+   * <p>One {@link ContextUtilities} instance is shared across all worker threads (it is cached on the
+   * worker context as part of the {@code FHIRPathAnalysis} every per-thread {@code FHIRPathEngine}
+   * retrieves). {@code allStructures()} lazily built {@code allStructuresList} with an unsynchronized
+   * {@code if (isEmpty()) ... list.add(...)}: two threads first-touching it concurrently both ran the
+   * loop and {@code add()}ed into the same {@link ArrayList}, tearing it - leaving a {@code null} slot
+   * that an immediate consumer ({@code FHIRPathEngine.addTypeAndDescendents} doing
+   * {@code sd.hasBaseDefinition()}) dereferenced into a message-less NPE. That surfaced when validating
+   * {@code SearchParameter} "searchparameter-example-constraint" (expression
+   * {@code Bundle.entry[0].resource}) as an intermittent extra ERROR (~1 build in 4-10, never at
+   * threads=1). The fix builds into a private local list and publishes it in one assignment. This test
+   * hammers a fresh (first-touch) shared instance from many threads and asserts no null slot, no
+   * exception, and a size identical to a serial reference - so removing the lock fails here.
+   */
+  @Test
+  void allStructuresIsThreadSafeUnderConcurrentFirstTouch() throws Exception {
+    IWorkerContext ctx = new SimpleWorkerContext(TestingUtilities.getSharedWorkerContext());
+    // serial reference + warm the shared SDs' snapshots once, so the racy part exercised below is the
+    // (cheap) concurrent list build itself, letting us run many trials quickly.
+    int refSize = new ContextUtilities(ctx).allStructures().size();
+    assertTrue(refSize > 0, "serial allStructures() must be non-empty");
+
+    int threads = Math.max(8, Runtime.getRuntime().availableProcessors());
+    for (int round = 0; round < 100; round++) {
+      // fresh ContextUtilities == fresh empty lazy field == first-touch race window, exactly mirroring
+      // analysis.cu being touched for the first time by N worker threads under the validation pool.
+      ContextUtilities cu = new ContextUtilities(ctx);
+      List<Throwable> errors = Collections.synchronizedList(new ArrayList<Throwable>());
+      List<Integer> sizes = Collections.synchronizedList(new ArrayList<Integer>());
+      ExecutorService pool = Executors.newFixedThreadPool(threads);
+      CountDownLatch gun = new CountDownLatch(1);
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < threads; t++) {
+        futures.add(pool.submit(() -> {
+          try {
+            gun.await();
+            List<StructureDefinition> all = cu.allStructures();
+            int n = 0;
+            for (StructureDefinition sd : all) {
+              assertNotNull(sd, "null slot in shared allStructuresList (torn concurrent ArrayList.add)");
+              sd.hasBaseDefinition(); // the exact dereference that NPEs pre-fix
+              n++;
+            }
+            sizes.add(n);
+          } catch (Throwable th) {
+            errors.add(th);
+          }
+        }));
+      }
+      gun.countDown();
+      for (Future<?> f : futures) {
+        f.get(120, TimeUnit.SECONDS);
+      }
+      pool.shutdown();
+
+      assertTrue(errors.isEmpty(), "round " + round + ": concurrent allStructures() threw: " + errors);
+      for (int n : sizes) {
+        assertEquals(refSize, n, "round " + round + ": a thread saw a different allStructures() size -> torn build");
+      }
+    }
+  }
 }

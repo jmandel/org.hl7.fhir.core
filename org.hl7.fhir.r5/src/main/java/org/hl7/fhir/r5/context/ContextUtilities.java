@@ -39,10 +39,17 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
   private IWorkerContext context;
   private XVerExtensionManager xverManager;
   private Map<String, String> oidCache = new HashMap<>();
-  private List<StructureDefinition> allStructuresList = new ArrayList<StructureDefinition>();
-  private List<String> canonicalResourceNames;
-  private List<String> concreteResourceNames;
-  private Set<String> concreteResourceNameSet;
+  // THREAD-SAFETY: a single ContextUtilities instance is shared across all parallel validation
+  // worker threads (it is cached on the worker context as part of the FHIRPathAnalysis that every
+  // per-thread FHIRPathEngine retrieves). These lazy caches are therefore built-once-and-published
+  // atomically under lazyCacheLock: each field is null until fully built, then assigned in one go, so
+  // a concurrent reader can only ever see a complete cache - never a half-filled list (whose torn
+  // ArrayList.add could leave a null slot and NPE a consumer). See allStructures().
+  private volatile List<StructureDefinition> allStructuresList = null;
+  private volatile List<String> canonicalResourceNames;
+  private volatile List<String> concreteResourceNames;
+  private volatile Set<String> concreteResourceNameSet;
+  private final Object lazyCacheLock = new Object();
   @Setter
   private List<String> suppressedMappings;
   @Getter
@@ -209,24 +216,43 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
    * @return a list of the resource names that are canonical resources defined for this version
    */
   public List<String> getCanonicalResourceNames() {
-    if (canonicalResourceNames == null) {
-      canonicalResourceNames = new ArrayList<>();
+    List<String> local = canonicalResourceNames;
+    if (local != null) {
+      return local;
+    }
+    synchronized (lazyCacheLock) {
+      if (canonicalResourceNames != null) {
+        return canonicalResourceNames;
+      }
+      List<String> built = new ArrayList<>();
       Set<String> names = new HashSet<>();
       for (StructureDefinition sd : allStructures()) {
         if (sd.getKind() == StructureDefinitionKind.RESOURCE && !sd.getAbstract() && hasUrlProperty(sd)) {
           names.add(sd.getType());
         }
       }
-      canonicalResourceNames.addAll(Utilities.sorted(names));
+      built.addAll(Utilities.sorted(names));
+      canonicalResourceNames = built;
+      return built;
     }
-    return canonicalResourceNames;
   }
 
   /**
    * @return a list of all structure definitions, with snapshots generated (if possible)
    */
   public List<StructureDefinition> allStructures() {
-    if (allStructuresList.isEmpty()) {
+    List<StructureDefinition> local = allStructuresList;
+    if (local != null) {
+      return local; // fast path: fully built, lock-free, no torn read possible
+    }
+    synchronized (lazyCacheLock) {
+      if (allStructuresList != null) {
+        return allStructuresList; // another thread finished the build while we waited
+      }
+      // build into a private local list and publish it in one assignment, so no concurrent reader
+      // (e.g. FHIRPathEngine.addTypeAndDescendents iterating + dereferencing each SD) can ever observe
+      // a half-populated list. generateSnapshot is already serialized + idempotent via SNAPSHOT_GEN_LOCK.
+      List<StructureDefinition> built = new ArrayList<StructureDefinition>();
       Set<StructureDefinition> set = new HashSet<StructureDefinition>();
       for (StructureDefinition sd : getStructures()) {
         if (!set.contains(sd)) {
@@ -237,12 +263,13 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
             log.debug("Unable to generate snapshot @2 for " + tail(sd.getUrl()) + " from " + tail(sd.getBaseDefinition()) + " because " + e.getMessage());
             context.getLogger().logDebugMessage(ILoggingService.LogCategory.GENERATE, ExceptionUtils.getStackTrace(e));
           }
-          allStructuresList.add(sd);
+          built.add(sd);
           set.add(sd);
         }
       }
+      allStructuresList = built;
+      return built;
     }
-    return allStructuresList;
   }
 
   /**
@@ -410,23 +437,39 @@ public class ContextUtilities implements ProfileKnowledgeProvider {
   }
 
   public Set<String> getConcreteResourceSet() {
-    if (concreteResourceNameSet == null) {
-      concreteResourceNameSet = new HashSet<>();
+    Set<String> local = concreteResourceNameSet;
+    if (local != null) {
+      return local;
+    }
+    synchronized (lazyCacheLock) {
+      if (concreteResourceNameSet != null) {
+        return concreteResourceNameSet;
+      }
+      Set<String> built = new HashSet<>();
       for (StructureDefinition sd : getStructures()) {
         if (sd.getKind() == StructureDefinitionKind.RESOURCE && !sd.getAbstract() && sd.getDerivation() == TypeDerivationRule.SPECIALIZATION) {
-          concreteResourceNameSet.add(sd.getType());
+          built.add(sd.getType());
         }
       }
+      concreteResourceNameSet = built;
+      return built;
     }
-    return concreteResourceNameSet;
   }
 
   public List<String> getConcreteResources() {
-    if (concreteResourceNames == null) {
-      concreteResourceNames = new ArrayList<>();
-      concreteResourceNames.addAll(Utilities.sorted(getConcreteResourceSet()));
+    List<String> local = concreteResourceNames;
+    if (local != null) {
+      return local;
     }
-    return concreteResourceNames;
+    synchronized (lazyCacheLock) {
+      if (concreteResourceNames != null) {
+        return concreteResourceNames;
+      }
+      List<String> built = new ArrayList<>();
+      built.addAll(Utilities.sorted(getConcreteResourceSet()));
+      concreteResourceNames = built;
+      return built;
+    }
   }
 
   public List<StructureMap> listMaps(String url) {
