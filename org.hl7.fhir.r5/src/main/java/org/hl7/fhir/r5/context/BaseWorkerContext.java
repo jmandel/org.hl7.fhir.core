@@ -732,7 +732,12 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       } else {
         List<T> rl = new ArrayList<T>();
         for (T t : list) {
-          if (t.getUrl().equals(r.getUrl()) && !rl.contains(t)) {
+          // null-guard the RECEIVER: an unresolvable external profile can be cached as a metadata
+          // resource with no url element; t.getUrl().equals(...) then NPEs, and the JVM's helpful-NPE
+          // message is emitted-or-omitted depending on JIT state -> the caught message leaks into a
+          // validation warning that flips run-to-run under parallel validation. (equals(null arg) is
+          // already safe, so only the receiver needs guarding.)
+          if (t.getUrl() != null && t.getUrl().equals(r.getUrl()) && !rl.contains(t)) {
             rl.add(t);
           }
         }
@@ -1302,7 +1307,16 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         if (!options.isUseServer()) {
          t.setResult(new ValidationResult(IssueSeverity.WARNING,formatMessage(I18nConstants.UNABLE_TO_VALIDATE_CODE_WITHOUT_USING_SERVER), TerminologyServiceErrorClass.BLOCKED_BY_OPTIONS, null));
         } else if (unsupportedCodeSystems.contains(codeKey)) {
-          t.setResult(new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, t.getCoding().getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, null));
+          // DETERMINISM: carry the canonical unknown-system issue shape (msg-id + Coding.system) so the
+          // memo-suppressed batch result is byte-identical to the live-server / single-validate shapes.
+          // Carry the canonical unknown-system issue shape whenever the coding is identifiable. Do NOT
+          // gate on vs (a bare code-system check passes vs==null, and the server still returns the
+          // canonical not-found issue) - gating on vs let the null-msg-id local shape leak and flip
+          // against the canonical pack/server shape by memo-arming order. unknownSystemIssues emits the
+          // not-in-vs issue only when a value set is actually present, matching the server exactly.
+          List<OperationOutcomeIssueComponent> bIssues = (t.getCoding().hasSystem() && t.getCoding().hasCode())
+              ? unknownSystemIssues(t.getCoding(), vs, masterServerAddress()) : null;
+          t.setResult(new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, t.getCoding().getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, bIssues));
           // SHADOW RECORDING (recording runs only): the suppression above answers the request locally
           // and excludes it from the server batch, so the request shape would never reach the
           // recorded pack; remember it so the exact request is still sent (and its answer cached)
@@ -1357,6 +1371,13 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
         if (r.getResource() instanceof Parameters) {
           t.setResult(processValidationResult((Parameters) r.getResource(), null, tc.getAddress()));
+          // DETERMINISM: normalize an unknown-system server result to the canonical issue shape, so the
+          // live-server batch shape is byte-identical to the suppression/synthesis shape (see the
+          // single-validate path); otherwise the warning flips by memo-arming order.
+          if (!t.getResult().isOk() && t.getResult().getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED
+              && t.getCoding().hasSystem() && t.getCoding().hasCode()) {
+            t.getResult().setIssues(unknownSystemIssues(t.getCoding(), vs, masterServerAddress()));
+          }
           // a real (pre-arming) server answer that live runs serve from cache on repeats: make
           // sure the answer-shape precedence check never discards its cached entry
           noteServerShapedUnknownSystemToken(t.getCacheToken(), t.getResult(), t.getCoding(), getCodeKey(t.getCoding()));
@@ -1654,12 +1675,40 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
       }
     }
     String codeKey = getCodeKey(code);
-    if (unsupportedCodeSystems.contains(codeKey)) {
+    // DETERMINISM: a gate-shaped request whose (system, vs) has a server-confirmed canonical UNKNOWN
+    // template must be answered by synthesis below (the live-faithful shape), NOT pre-empted by the
+    // CODESYSTEM_UNSUPPORTED memo. Otherwise the answer depends on whether unsupportedCodeSystems was
+    // armed first - by some OTHER request shape of the same system under the parallel validation pool -
+    // which flips the validator's unknown-system warning between Coding and Coding.system run to run.
+    // serverConfirmedUnknownSystems is only armed from a real canonical server response, so deferring
+    // to synthesis here reproduces exactly what a pure-live (no-memo) run would have returned.
+    boolean synthesizable = unknownSynthGate(options, code, vs, localError)
+        && serverConfirmedUnknownSystems.contains(unknownSystemMemoKey(code, vs));
+    if (unsupportedCodeSystems.contains(codeKey) && !synthesizable) {
       // SHADOW RECORDING (recording runs only): the per-run suppression below answers this request
       // locally, so without this the recorded pack would only carry the FIRST probe shape per
       // unknown system; the shadow sends the exact request the un-suppressed path would have sent,
       // caches the answer (making it packable), and changes nothing about what this call returns.
       shadowRecordSuppressedCodingValidation(cacheToken, options, code, vs, localError, localWarning, type, codeKey);
+      // DETERMINISM: the local resolution of an unknown system that defers to the server throws a
+      // plain FHIRException(NO_TRY_THE_SERVER), caught generically above, so `issues` is empty here.
+      // An empty-issues CODESYSTEM_UNSUPPORTED result makes InstanceValidator hardcode the warning at
+      // path+".system" (warned=false fallback), whereas the FIRST (live-server) probe of the same
+      // system returns server-shaped issues that drive the location via the issue expression - so the
+      // warning location flips between Coding and Coding.system depending on which thread armed the
+      // (system-keyed) memo first. Populate the canonical unknown-system issue shape (the same helper
+      // synthesis uses) so the location is a pure function of inputs. errorClass stays
+      // CODESYSTEM_UNSUPPORTED (NOT UNKNOWN: under a REQUIRED binding UNKNOWN would become an ERROR).
+      // This branch is definitionally an unknown system (unsupportedCodeSystems contains codeKey), so
+      // any locally-built issues describe that same system - replace them with the canonical shape
+      // unconditionally so the result is byte-identical to the server/synthesis/pack path. Do NOT gate
+      // on vs: a bare code-system existence check passes vs==null and the server still returns the
+      // canonical not-found issue; gating on vs let the null-msg-id local shape leak and flip by
+      // memo-arming order. unknownSystemIssues adds the not-in-vs issue only when a value set is present.
+      if (code.hasSystem() && code.hasCode()) {
+        issues.clear();
+        issues.addAll(unknownSystemIssues(code, vs, masterServerAddress()));
+      }
       return new ValidationResult(IssueSeverity.ERROR,formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem()), TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED, issues);
     }
     
@@ -1688,6 +1737,17 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
         res = new ValidationResult(IssueSeverity.ERROR, e.getMessage() == null ? e.getClass().getName() : e.getMessage(), null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(TerminologyServiceErrorClass.SERVER_ERROR);
       }
       maybeRecordServerUnknownSystem(options, code, vs, res, localError);
+      // DETERMINISM: a live-server unknown-system result carries issues WITHOUT the UNKNOWN_CODESYSTEM
+      // msg-id extension and with expression "Coding" (not "Coding.system"), whereas the local
+      // suppression/synthesis path for the same (system, vs) carries the canonical unknownSystemIssues
+      // (msg-id + "Coding.system"). Which one a coding gets depends on parallel memo-arming order, so
+      // the validator's `warned` guard flips -> the unknown-system warning's msg-id/location and even
+      // its presence (the fallback txWarning double-fires when warned=false) vary run to run.
+      // Normalize the server result to the canonical shape so every path is byte-identical.
+      if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED
+          && code.hasSystem() && code.hasCode()) {
+        res.setIssues(unknownSystemIssues(code, vs, masterServerAddress()));
+      }
     }
     if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && (localError != null && !localError.equals(ValueSetValidator.NO_TRY_THE_SERVER))) {
       res = new ValidationResult(IssueSeverity.ERROR, localError, null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(type);
@@ -2495,11 +2555,18 @@ public abstract class BaseWorkerContext extends I18nBase implements IWorkerConte
 
   private List<OperationOutcomeIssueComponent> unknownSystemIssues(Coding code, ValueSet vs, String server) {
     List<OperationOutcomeIssueComponent> issues = new ArrayList<>();
+    // The unknown-SYSTEM not-found issue is always present (and is what drives the coding.system
+    // warning). The not-in-VS issue is only emitted when a value set is actually in play - a bare
+    // code-system existence check (vs == null, e.g. InstanceValidator probing whether a Coding's
+    // system is known) returns just the not-found issue, exactly as the server does. Matching that
+    // shape here is what makes the local suppression path byte-identical to the server/pack answer.
     issues.add(unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType.NOTFOUND, "not-found",
         formatMessage(I18nConstants.UNKNOWN_CODESYSTEM, code.getSystem()), I18nConstants.UNKNOWN_CODESYSTEM, "Coding.system", server));
-    issues.add(unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType.CODEINVALID, "not-in-vs",
-        formatMessage(I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, null, vs.getVersionedUrl(), "'"+code.getSystem()+"#"+code.getCode()+"'"),
-        I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, "Coding.code", server));
+    if (vs != null && vs.hasUrl()) {
+      issues.add(unknownSystemIssue(org.hl7.fhir.r5.model.OperationOutcome.IssueType.CODEINVALID, "not-in-vs",
+          formatMessage(I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, null, vs.getVersionedUrl(), "'"+code.getSystem()+"#"+code.getCode()+"'"),
+          I18nConstants.NONE_OF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_ONE, "Coding.code", server));
+    }
     return issues;
   }
 

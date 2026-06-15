@@ -717,6 +717,21 @@ public class BaseValidator implements IValidationContextResourceLoader, IMessagi
     if (issue.hasExpression() && issue.getExpression().get(0).getValue().contains(".")) {
       path = path + dropHead(issue.getExpression().get(0).getValue());
     }
+    // DETERMINISM: the unknown-code-system warning is fundamentally about the Coding.system element,
+    // but different validateCode result paths carry it with issue expression "Coding" (live server,
+    // often with NO msg-id extension) vs "Coding.system" (local suppression/synthesis, with the
+    // UNKNOWN_CODESYSTEM msg-id). Under parallel validation, which shape a given coding gets depends on
+    // memo-arming order, so the reported location flips between the Coding and its .system child run to
+    // run. Normalise it to the .system child always - semantically correct and a pure function of the
+    // path. Detect by msg-id OR by the message text (the cross-path signal for server-shaped issues
+    // that lack the extension; the build pins en-US so the text is stable).
+    String txMsgId = issue.getExtensionString(ExtensionDefinitions.EXT_ISSUE_MSG_ID);
+    String txDetail = issue.getDetails() != null ? issue.getDetails().getText() : null;
+    boolean unknownCodeSystem = "UNKNOWN_CODESYSTEM".equals(txMsgId)
+        || (txDetail != null && txDetail.contains("could not be found, so the code cannot be validated"));
+    if (unknownCodeSystem && !path.endsWith(".system")) {
+      path = path + ".system";
+    }
     IssueType code = IssueType.fromCode(issue.getCode().toCode());
     IssueSeverity severity = IssueSeverity.fromCode(issue.getSeverity().toCode());
     ValidationMessage validationMessage = new ValidationMessage(Source.TerminologyEngine, code, line, col, path, issue.getDetails().getText(), severity).setTxLink(txLink).setDiagnostics(diagnostics);
