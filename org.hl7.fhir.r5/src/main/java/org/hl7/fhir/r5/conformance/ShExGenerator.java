@@ -488,7 +488,9 @@ public class ShExGenerator {
 
       if (references.size() > 0) {
         shapeDefinitions.append("\n#---------------------- Reference Types -------------------\n");
-        for (String r : references) {
+        // DETERMINISM: references is a HashSet; emit in sorted order so reference-type shapes appear
+        // in the same order in every build.
+        for (String r : new TreeSet<String>(references)) {
           var rClassName = TurtleParser.getClassName(r);
           shapeDefinitions.append("\n").append(tmplt(TYPED_REFERENCE_TEMPLATE).add("refType", rClassName).render()).append("\n");
           if (!"Resource".equals(rClassName) && !known_resources.contains(rClassName))
@@ -497,10 +499,13 @@ public class ShExGenerator {
       }
 
       if (completeModel && known_resources.size() > 0) {
+        // DETERMINISM: known_resources is a HashSet; use a sorted view so the COMPLETE/ALL shapes
+        // list the resources in the same order in every build.
+        TreeSet<String> sortedKnownResources = new TreeSet<String>(known_resources);
         shapeDefinitions.append("\n").append(tmplt(COMPLETE_RESOURCE_TEMPLATE)
-          .add("resources", StringUtils.join(known_resources, "> OR\n\t@<")).render());
+          .add("resources", StringUtils.join(sortedKnownResources, "> OR\n\t@<")).render());
         List<String> all_entries = new ArrayList<String>();
-        for (String kr : known_resources)
+        for (String kr : sortedKnownResources)
           all_entries.add(tmplt(ALL_ENTRY_TEMPLATE).add("id", TurtleParser.getClassName(kr)).render());
         shapeDefinitions.append("\n").append(tmplt(ALL_TEMPLATE)
           .add("all_entries", StringUtils.join(all_entries, " OR\n\t")).render());
@@ -508,11 +513,20 @@ public class ShExGenerator {
 
       if (required_value_sets.size() > 0) {
         shapeDefinitions.append("\n#---------------------- Value Sets ------------------------\n");
+        // DETERMINISM: required_value_sets is a HashSet<ValueSet> and ValueSet has no hashCode/equals
+        // override, so its iteration order is identity-hash order (varies per JVM run). The old
+        // ShExComparator only ordered on the "fhirvs:" substring, which is empty for non-FHIR value
+        // sets, leaving them as mutual ties whose order then fell back to the identity-hash order ->
+        // the Value Sets block reordered run to run (a 2-element tie swaps ~50% of builds). Sort the
+        // ValueSet OBJECTS by a stable TOTAL key (versioned url) up front, so both the genValueSet()
+        // call order and the emitted order are deterministic.
+        List<ValueSet> sortedVsObjs = new ArrayList<ValueSet>(required_value_sets);
+        sortedVsObjs.sort(Comparator
+          .comparing((ValueSet vs) -> vs.hasUrl() ? vs.getVersionedUrl() : "")
+          .thenComparing(vs -> vs.hasName() ? vs.getName() : ""));
         List<String> sortedVS = new ArrayList<String>();
-        for (ValueSet vs : required_value_sets)
+        for (ValueSet vs : sortedVsObjs)
           sortedVS.add(genValueSet(vs));
-
-        Collections.sort(sortedVS, new ShExComparator());
 
         for (String svs : sortedVS)
           shapeDefinitions.append("\n").append(svs);
@@ -1202,7 +1216,13 @@ public class ShExGenerator {
   private String emitInnerTypes() {
     StringBuilder itDefs = new StringBuilder();
     while(emittedInnerTypes.size() < innerTypes.size()) {
-      for (Pair<StructureDefinition, ElementDefinition> it : new HashSet<Pair<StructureDefinition, ElementDefinition>>(innerTypes)) {
+      // DETERMINISM: iterate in a stable sorted order (innerTypes is a HashSet whose iteration order
+      // varies per run), so emitted inner-type shapes appear in the same order in every build.
+      List<Pair<StructureDefinition, ElementDefinition>> sortedInner = new ArrayList<>(innerTypes);
+      sortedInner.sort(Comparator
+        .comparing((Pair<StructureDefinition, ElementDefinition> it) -> it.getLeft().getName())
+        .thenComparing(it -> it.getRight().hasId() ? it.getRight().getId() : it.getRight().getPath()));
+      for (Pair<StructureDefinition, ElementDefinition> it : sortedInner) {
         if ((!emittedInnerTypes.contains(it))
           // && (it.getRight().hasBase() && it.getRight().getBase().getPath().startsWith(it.getLeft().getName()))
         ){
@@ -1237,7 +1257,9 @@ public class ShExGenerator {
   private String emitDataTypes() {
     StringBuilder dtDefs = new StringBuilder();
     while (emittedDatatypes.size() < datatypes.size()) {
-      for (String dt : new HashSet<String>(datatypes)) {
+      // DETERMINISM: emit datatypes in sorted order (datatypes is a HashSet) so the data-type shape
+      // definitions appear in the same order in every build.
+      for (String dt : new TreeSet<String>(datatypes)) {
         if (!emittedDatatypes.contains(dt)) {
           StructureDefinition sd = context.fetchResource(StructureDefinition.class,
             ProfileUtilities.sdNs(dt, null), IWorkerContext.VersionResolutionRules.defaultRule());
